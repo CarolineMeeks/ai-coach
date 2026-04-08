@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Recovery-First Coach</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Recovery-First Coach</p>
+        <h1>Fat loss, lean-mass protection, and fewer dumb decisions.</h1>
+        <p class="lede">This coach blends Fitbit recovery signals, body composition, and Zepbound timing into one browser-based conversation.</p>
+      </div>
+      <div class="hero-card" id="summary-card">
+        <p class="label">Loading today's read...</p>
+      </div>
+    </section>
+
+    <section class="dashboard">
+      <article class="panel metrics">
+        <div class="panel-head">
+          <h2>Today</h2>
+          <input id="date-input" type="date">
+        </div>
+        <div class="metric-grid" id="metric-grid"></div>
+      </article>
+
+      <article class="panel quick-asks">
+        <div class="panel-head">
+          <h2>Quick Asks</h2>
+        </div>
+        <div class="chips">
+          <button class="chip" data-prompt="What should I do today?">What should I do today?</button>
+          <button class="chip" data-prompt="Can I train today?">Can I train today?</button>
+          <button class="chip" data-prompt="How is my 7-day trend?">How is my 7-day trend?</button>
+          <button class="chip" data-prompt="Am I losing fat or lean mass?">Am I losing fat or lean mass?</button>
+          <button class="chip" data-prompt="How many days since my shot?">How many days since my shot?</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="chat-layout">
+      <article class="panel chat-panel">
+        <div class="panel-head">
+          <h2>Coach Chat</h2>
+        </div>
+        <div id="chat-log" class="chat-log"></div>
+        <form id="chat-form" class="chat-form">
+          <textarea id="chat-input" rows="3" placeholder="Ask about training, recovery, body composition, or Zepbound timing."></textarea>
+          <button id="chat-submit" type="submit">Ask Coach</button>
+        </form>
+      </article>
+
+      <article class="panel side-notes">
+        <div class="panel-head">
+          <h2>Trend Snapshot</h2>
+        </div>
+        <div id="trend-notes" class="notes"></div>
+      </article>
+    </section>
+
+    <section class="history-layout">
+      <article class="panel">
+        <div class="panel-head">
+          <h2>Recent Interactions</h2>
+        </div>
+        <div id="history-log" class="history-log"></div>
+      </article>
+    </section>
+  </main>
+
+  <template id="message-template">
+    <div class="message">
+      <p class="speaker"></p>
+      <p class="content"></p>
+    </div>
+  </template>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+.env
+.venv/
+.pycache/
+__pycache__/
+.fitbit_tokens.json
+coach_interactions.jsonl
