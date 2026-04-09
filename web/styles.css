@@ -85,6 +85,52 @@ body {
   padding: 24px;
 }
 
+.goal-callout {
+  margin-top: 18px;
+  margin-bottom: 14px;
+  padding: 16px 18px;
+  border-radius: 20px;
+  border: 1px solid rgba(31, 41, 51, 0.08);
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.goal-callout[data-status="met"] {
+  border-color: rgba(15, 118, 110, 0.28);
+  background: rgba(214, 248, 239, 0.9);
+}
+
+.goal-callout[data-status="close"] {
+  border-color: rgba(154, 52, 18, 0.24);
+  background: rgba(255, 243, 230, 0.92);
+}
+
+.goal-callout[data-status="not_met"] {
+  border-color: rgba(31, 41, 51, 0.12);
+}
+
+.goal-eyebrow {
+  margin: 0 0 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.72rem;
+  color: var(--accent);
+}
+
+.goal-callout h3 {
+  margin: 0 0 8px;
+  font-size: 1.4rem;
+}
+
+.goal-callout p {
+  margin: 0 0 8px;
+  line-height: 1.5;
+}
+
+.goal-meta {
+  color: var(--muted);
+  font-size: 0.95rem;
+}
+
 .eyebrow,
 .label,
 .speaker {

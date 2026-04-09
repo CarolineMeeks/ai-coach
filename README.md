@@ -65,6 +65,10 @@ python3 fitbit_client.py trends --date 2026-04-08 --days 7
 python3 fitbit_client.py bodycomp --date 2026-04-08 --days 30
 python3 fitbit_client.py fatloss --date 2026-04-08 --days 30
 python3 fitbit_client.py zepbound --date 2026-04-08
+python3 fitbit_client.py water --date 2026-04-08
+python3 fitbit_client.py log-water 24 --date 2026-04-08
+python3 fitbit_client.py water-reminder --date 2026-04-08 --window noon
+python3 fitbit_client.py water-reply "18 oz" --date 2026-04-08
 python3 fitbit_client.py chat --date 2026-04-08
 python3 coach_web.py --host 127.0.0.1 --port 8000
 ```
@@ -87,6 +91,7 @@ The browser UI shows:
 
 - a daily readiness panel
 - body composition and Zepbound snapshot metrics
+- hydration progress for the day
 - quick question buttons
 - a plain-English chat interface backed by the same coaching logic as the CLI
 - a recent interaction history panel loaded from the SQLite app database
@@ -146,6 +151,52 @@ Each record includes:
 - date context
 - your message
 - the coach reply
+
+## Water goal support
+
+The coach now supports a daily hydration target:
+
+- base range: `80-100 oz`
+- active-day bonus: added automatically when exercise or movement volume is high
+- warm-day bonus: supported by the water-report/reminder commands via `--warm-day`
+
+Useful commands:
+
+- `python3 fitbit_client.py water --date 2026-04-08`
+- `python3 fitbit_client.py log-water 24 --date 2026-04-08`
+- `python3 fitbit_client.py water-reminder --date 2026-04-08 --window noon`
+- `python3 fitbit_client.py water-reply "18 oz" --date 2026-04-08`
+
+The browser API also exposes:
+
+- `GET /api/water?date=YYYY-MM-DD`
+- `POST /api/water` with `{ "date": "YYYY-MM-DD", "amount_oz": 24 }`
+
+## SMS reminders
+
+The app now includes Twilio-ready SMS helpers for hydration reminders and reply logging.
+
+Set these optional env vars:
+
+- `TWILIO_ACCOUNT_SID`
+- `TWILIO_AUTH_TOKEN`
+- `TWILIO_FROM_NUMBER`
+- `SMS_TO_NUMBER`
+
+Useful commands:
+
+- preview a noon reminder:
+  - `python3 fitbit_client.py water-reminder --date 2026-04-08 --window noon`
+- preview an evening reminder:
+  - `python3 fitbit_client.py water-reminder --date 2026-04-08 --window evening`
+- send one through Twilio:
+  - `python3 fitbit_client.py water-reminder --date 2026-04-08 --window noon --send`
+
+For inbound SMS, the web app exposes:
+
+- `POST /sms/webhook`
+
+That webhook currently parses water replies like `24 oz`, logs the intake, and returns a short confirmation message.
 
 ## Optional OpenAI conversation layer
 

@@ -9,6 +9,7 @@ import csv
 import io
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -55,6 +56,10 @@ class FitbitConfig:
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.4-mini"
     openai_base_url: str = "https://api.openai.com/v1"
+    twilio_account_sid: str | None = None
+    twilio_auth_token: str | None = None
+    twilio_from_number: str | None = None
+    sms_to_number: str | None = None
 
     @classmethod
     def from_env(cls) -> "FitbitConfig":
@@ -71,6 +76,10 @@ class FitbitConfig:
         openai_api_key = os.getenv("OPENAI_API_KEY", "").strip() or None
         openai_model = os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
         openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1"
+        twilio_account_sid = os.getenv("TWILIO_ACCOUNT_SID", "").strip() or None
+        twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip() or None
+        twilio_from_number = os.getenv("TWILIO_FROM_NUMBER", "").strip() or None
+        sms_to_number = os.getenv("SMS_TO_NUMBER", "").strip() or None
 
         missing = [
             name
@@ -95,6 +104,10 @@ class FitbitConfig:
             openai_api_key=openai_api_key,
             openai_model=openai_model,
             openai_base_url=openai_base_url,
+            twilio_account_sid=twilio_account_sid,
+            twilio_auth_token=twilio_auth_token,
+            twilio_from_number=twilio_from_number,
+            sms_to_number=sms_to_number,
         )
 
 
@@ -323,6 +336,35 @@ class FitbitClient:
     def get_user_goals(self) -> dict[str, Any]:
         return self.db.get_user_goals(self.user.id)
 
+    def add_water_intake(self, log_date: str, amount_oz: float, source: str = "manual", note: str | None = None) -> None:
+        self.db.add_water_intake(self.user.id, log_date, amount_oz, source=source, note=note)
+
+    def get_water_intake_logs(self, log_date: str) -> list[dict[str, Any]]:
+        return self.db.get_water_intake_logs(self.user.id, log_date)
+
+    def get_water_total(self, log_date: str) -> float:
+        return self.db.get_water_total(self.user.id, log_date)
+
+    def send_sms(self, body: str, to_number: str | None = None) -> dict[str, Any]:
+        if not (self.config.twilio_account_sid and self.config.twilio_auth_token and self.config.twilio_from_number):
+            raise FitbitConfigError("Twilio is not configured. Set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_FROM_NUMBER.")
+        destination = to_number or self.config.sms_to_number
+        if not destination:
+            raise FitbitConfigError("Missing destination phone number. Set SMS_TO_NUMBER or provide a to_number.")
+
+        response = requests.post(
+            f"https://api.twilio.com/2010-04-01/Accounts/{self.config.twilio_account_sid}/Messages.json",
+            auth=(self.config.twilio_account_sid, self.config.twilio_auth_token),
+            data={
+                "From": self.config.twilio_from_number,
+                "To": destination,
+                "Body": body,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
 
 def get_day_snapshot(client: FitbitClient, target_date: str) -> dict[str, Any]:
     activity = client.get_json(f"/1/user/-/activities/date/{target_date}.json")
@@ -446,6 +488,48 @@ def build_google_csv_url(sheet_url: str) -> str:
     raise FitbitConfigError("ZEPBOUND_SHEET_URL must be a Google Sheets edit or CSV export URL.")
 
 
+def parse_water_oz(text: str) -> float | None:
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:oz|ounces?)\b", text.lower())
+    if match:
+        return round(float(match.group(1)), 1)
+    if text.strip().isdigit():
+        return round(float(text.strip()), 1)
+    return None
+
+
+def interpret_water_entry(text: str, current_total_oz: float) -> dict[str, Any] | None:
+    amount_oz = parse_water_oz(text)
+    if amount_oz is None:
+        return None
+
+    lowered = text.strip().lower()
+    incremental_markers = ["another", "more", "plus", "add ", "added", "extra", "just drank", "had another"]
+    total_markers = ["total", "so far", "for today", "all day", "actually", "correction", "correct", "reset", "no "]
+    is_increment = any(marker in lowered for marker in incremental_markers)
+    is_total = any(marker in lowered for marker in total_markers)
+
+    if is_increment:
+        return {
+            "entry_type": "increment",
+            "logged_amount_oz": amount_oz,
+            "reported_total_oz": round(current_total_oz + amount_oz, 1),
+        }
+
+    delta = round(amount_oz - current_total_oz, 1)
+    if delta <= 0 and not is_total:
+        return {
+            "entry_type": "total",
+            "logged_amount_oz": 0.0,
+            "reported_total_oz": amount_oz,
+        }
+
+    return {
+        "entry_type": "total",
+        "logged_amount_oz": delta,
+        "reported_total_oz": amount_oz,
+    }
+
+
 def coach_day(day: dict[str, Any]) -> dict[str, Any]:
     recovery_score = 0
     movement_score = 0
@@ -525,6 +609,121 @@ def coach_day(day: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_water_report(client: FitbitClient, target_date: str, warm_day: bool = False) -> dict[str, Any]:
+    goals = client.get_user_goals()
+    coach = build_coach_report(client, target_date)
+    stats = coach["stats"]
+    total_oz = client.get_water_total(target_date)
+    logs = client.get_water_intake_logs(target_date)
+
+    active_bonus = goals["water_goal_active_bonus_oz"] if stats["zone_minutes"] >= 30 or stats["movement_minutes"] >= 120 else 0
+    warm_bonus = goals["water_goal_warm_bonus_oz"] if warm_day else 0
+    minimum_target = goals["water_goal_min_oz"] + active_bonus + warm_bonus
+    ideal_target = goals["water_goal_max_oz"] + active_bonus + warm_bonus
+
+    if total_oz >= ideal_target:
+        status = "met"
+    elif total_oz >= minimum_target:
+        status = "good"
+    elif total_oz >= minimum_target * 0.65:
+        status = "close"
+    else:
+        status = "behind"
+
+    notes: list[str] = []
+    if active_bonus:
+        notes.append("Activity bumped the hydration target up a bit today.")
+    if warm_bonus:
+        notes.append("Warm-day bonus is on, so the hydration target is higher.")
+    if status == "met":
+        notes.append("Hydration goal is already handled. Nicely boring, exactly how we like it.")
+    elif status == "good":
+        notes.append("You are in the solid range already; a little more would polish it off.")
+    elif status == "close":
+        notes.append("You are close enough that one focused refill would change the story.")
+    else:
+        notes.append("Hydration is lagging, and that gets more expensive on active or recovery-sensitive days.")
+
+    return {
+        "date": target_date,
+        "total_oz": total_oz,
+        "minimum_target_oz": minimum_target,
+        "ideal_target_oz": ideal_target,
+        "active_bonus_oz": active_bonus,
+        "warm_bonus_oz": warm_bonus,
+        "status": status,
+        "logs": logs,
+        "coach_notes": notes,
+    }
+
+
+def format_water_reply(report: dict[str, Any]) -> str:
+    notes = " ".join(report["coach_notes"])
+    return (
+        f"Water so far today is {report['total_oz']} oz. "
+        f"The target range is {report['minimum_target_oz']} to {report['ideal_target_oz']} oz today. "
+        f"Status: {report['status']}. {notes}"
+    )
+
+
+def build_water_sms_prompt(client: FitbitClient, target_date: str, window: str, warm_day: bool = False) -> dict[str, Any]:
+    report = build_water_report(client, target_date, warm_day=warm_day)
+    if window == "noon":
+        return {
+            "send": True,
+            "message": (
+                f"Coach check-in: how much water have you had so far today? "
+                f"You are at {report['total_oz']} oz. Today's target range is {report['minimum_target_oz']}-{report['ideal_target_oz']} oz. "
+                "Reply with a number like '24 oz'."
+            ),
+            "reason": "midday_check_in",
+        }
+    if window == "evening":
+        if report["status"] == "met":
+            return {
+                "send": False,
+                "message": None,
+                "reason": "goal_already_met",
+            }
+        return {
+            "send": True,
+            "message": (
+                f"9:45 hydration check: you are at {report['total_oz']} oz so far, with a target range of "
+                f"{report['minimum_target_oz']}-{report['ideal_target_oz']} oz today. Reply with your total for today, "
+                "like '82 oz'."
+            ),
+            "reason": "goal_still_open",
+        }
+    raise ValueError(f"Unsupported water reminder window: {window}")
+
+
+def handle_water_sms_reply(client: FitbitClient, body: str, target_date: str) -> str:
+    current_total = client.get_water_total(target_date)
+    interpreted = interpret_water_entry(body, current_total)
+    if interpreted is None:
+        return "I could not parse the water amount. Reply with something like '24 oz'."
+    if interpreted["logged_amount_oz"] != 0:
+        client.add_water_intake(target_date, interpreted["logged_amount_oz"], source="sms", note=body.strip())
+    report = build_water_report(client, target_date)
+    if interpreted["entry_type"] == "total" and interpreted["logged_amount_oz"] == 0:
+        return (
+            f"Got it. I already had you at {current_total} oz, so I did not add more. "
+            f"Current total stays {report['total_oz']} oz."
+        )
+    if interpreted["entry_type"] == "total" and interpreted["logged_amount_oz"] < 0:
+        return (
+            f"Corrected. I reset your total to {report['total_oz']} oz for today."
+        )
+    if report["status"] == "met":
+        return (
+            f"Logged {interpreted['logged_amount_oz']} oz. You are now at {report['total_oz']} oz, which clears today's hydration target. Nice work."
+        )
+    return (
+        f"Logged {interpreted['logged_amount_oz']} oz. You are now at {report['total_oz']} oz, with a goal range of "
+        f"{report['minimum_target_oz']}-{report['ideal_target_oz']} oz today."
+    )
+
+
 def get_weight_logs(client: FitbitClient, start_date: str, end_date: str) -> dict[str, Any]:
     return client.get_json(f"/1/user/-/body/log/weight/date/{start_date}/{end_date}.json")
 
@@ -599,10 +798,82 @@ def run_bodycomp(client: FitbitClient, end_date: str, days: int) -> None:
     print(json.dumps(build_bodycomp_report(client, end_date, days), indent=2))
 
 
+def build_primary_goal(client: FitbitClient, target_date: str, day: dict[str, Any], goals: dict[str, Any]) -> dict[str, Any]:
+    target = datetime.strptime(target_date, "%Y-%m-%d").date()
+    yesterday_date = (target - timedelta(days=1)).isoformat()
+    yesterday: dict[str, Any] | None = None
+    try:
+        yesterday = summarize_day(get_day_snapshot(client, yesterday_date))
+    except Exception:  # noqa: BLE001
+        yesterday = None
+
+    yesterday_trained = bool(yesterday and yesterday["zone_minutes"] >= 30)
+    recovery_biased_day = day["readiness"] in {"amber", "trained-but-watch-recovery", "yellow"}
+
+    if yesterday_trained and recovery_biased_day and day["zone_minutes"] < 30:
+        target_minutes = 30
+        status = "met" if day["movement_minutes"] >= target_minutes else "close" if day["movement_minutes"] >= 20 else "not_met"
+        return {
+            "kind": "recovery_walk",
+            "label": "Recovery walk",
+            "target": target_minutes,
+            "unit": "movement_minutes",
+            "actual": day["movement_minutes"],
+            "status": status,
+            "reason": "Yesterday already had real training, so today’s smart goal is restorative movement rather than more intensity.",
+        }
+
+    step_target = goals["step_goal"]
+    step_status = "met" if day["steps"] >= step_target else "close" if day["steps"] >= step_target * 0.8 else "not_met"
+    return {
+        "kind": "steps",
+        "label": "Daily movement",
+        "target": step_target,
+        "unit": "steps",
+        "actual": day["steps"],
+        "status": step_status,
+        "reason": "Base movement is still the easiest high-return lever for fat loss and recovery.",
+    }
+
+
+def build_exercise_goal(day: dict[str, Any], goals: dict[str, Any], primary_goal: dict[str, Any]) -> dict[str, Any]:
+    zone_target = goals["zone_min_goal"]
+    if primary_goal["kind"] == "recovery_walk":
+        return {
+            "label": "Recovery movement",
+            "target": primary_goal["target"],
+            "unit": primary_goal["unit"],
+            "actual": primary_goal["actual"],
+            "status": primary_goal["status"],
+            "reason": "On recovery days, purposeful walking counts as the exercise win instead of chasing heart-rate zones.",
+        }
+
+    zone_minutes = day["zone_minutes"]
+    movement_minutes = day["movement_minutes"]
+    steps = day["steps"]
+
+    if zone_minutes >= zone_target or movement_minutes >= 45 or (zone_minutes >= 20 and steps >= goals["step_goal"] * 0.8):
+        status = "met"
+    elif zone_minutes >= max(10, zone_target * 0.5) or movement_minutes >= 25 or steps >= goals["step_goal"] * 0.6:
+        status = "close"
+    else:
+        status = "not_met"
+
+    return {
+        "label": "Combined exercise",
+        "target": zone_target,
+        "unit": "zone-minute equivalent",
+        "actual": zone_minutes,
+        "status": status,
+        "reason": "Zone minutes count most, but purposeful walking and meaningful step volume still count on lighter days.",
+    }
+
+
 def build_coach_report(client: FitbitClient, target_date: str) -> dict[str, Any]:
     day = summarize_day(get_day_snapshot(client, target_date))
     coaching = coach_day(day)
     goals = client.get_user_goals()
+    day["readiness"] = coaching["readiness"]
 
     goal_status = {
         "steps": {
@@ -616,12 +887,16 @@ def build_coach_report(client: FitbitClient, target_date: str) -> dict[str, Any]
             "status": "met" if day["zone_minutes"] >= goals["zone_min_goal"] else "close" if day["zone_minutes"] >= goals["zone_min_goal"] * 0.67 else "not_met",
         },
     }
+    primary_goal = build_primary_goal(client, target_date, day, goals)
+    exercise_goal = build_exercise_goal(day, goals, primary_goal)
 
     return {
         "date": target_date,
         "readiness": coaching["readiness"],
         "prescription": coaching["prescription"],
         "goal_status": goal_status,
+        "primary_goal": primary_goal,
+        "exercise_goal": exercise_goal,
         "stats": {
             "steps": day["steps"],
             "step_goal": day["step_goal"],
@@ -841,6 +1116,16 @@ def build_zepbound_report(client: FitbitClient, target_date: str) -> dict[str, A
     if not coach_notes:
         coach_notes.append("Your dosing data is available, so we can line up appetite, recovery, and training around the shot cycle.")
 
+    shot_logged_today = bool(last_dose and last_dose["date"] == target_date)
+    shot_status = "met" if shot_logged_today else "pending" if target_date == date.today().isoformat() else "not_met"
+    shot_summary = (
+        "Shot logged today"
+        if shot_status == "met"
+        else "Shot still open for later today"
+        if shot_status == "pending"
+        else "No shot logged for this date"
+    )
+
     return {
         "date": target_date,
         "latest_entry": latest,
@@ -850,8 +1135,9 @@ def build_zepbound_report(client: FitbitClient, target_date: str) -> dict[str, A
         "goal_status": {
             "shot_logged": {
                 "required": goals["shot_logging_required"],
-                "actual": bool(last_dose and last_dose["date"] == target_date),
-                "status": "met" if not goals["shot_logging_required"] or (last_dose and last_dose["date"] == target_date) else "not_met",
+                "actual": shot_logged_today,
+                "status": "met" if not goals["shot_logging_required"] else shot_status,
+                "summary": shot_summary,
             }
         },
         "coach_notes": coach_notes,
@@ -865,17 +1151,38 @@ def build_daily_wins(client: FitbitClient, target_date: str) -> list[dict[str, A
     bodycomp = build_bodycomp_report(client, target_date, 1)
 
     wins: list[dict[str, Any]] = []
+    stats = coach["stats"]
+    primary_goal = coach["primary_goal"]
+    if primary_goal["status"] == "met":
+        if primary_goal["kind"] == "recovery_walk":
+            wins.append(
+                {
+                    "kind": "recovery_walk",
+                    "label": f"Recovery walk goal met: {primary_goal['actual']} / {primary_goal['target']} movement minutes",
+                }
+            )
+        else:
+            wins.append(
+                {
+                    "kind": "primary_goal",
+                    "label": f"{primary_goal['label']} goal met: {primary_goal['actual']} / {primary_goal['target']} {primary_goal['unit']}",
+                }
+            )
+
     step_goal = coach["goal_status"]["steps"]
-    if step_goal["status"] == "met":
+    if step_goal["status"] == "met" and primary_goal["kind"] != "steps":
         wins.append({"kind": "steps", "label": f"Step goal met: {step_goal['actual']} / {step_goal['target']}"})
     elif step_goal["status"] == "close":
         wins.append({"kind": "steps_close", "label": f"Close on steps: {step_goal['actual']} / {step_goal['target']}"})
 
-    zone_goal = coach["goal_status"]["zone_minutes"]
-    if zone_goal["status"] == "met":
-        wins.append({"kind": "zone_minutes", "label": f"Exercise goal met: {zone_goal['actual']} / {zone_goal['target']} zone minutes"})
-    elif zone_goal["status"] == "close":
-        wins.append({"kind": "zone_minutes_close", "label": f"Close on exercise: {zone_goal['actual']} / {zone_goal['target']} zone minutes"})
+    if stats["movement_minutes"] >= 30 and primary_goal["kind"] != "recovery_walk":
+        wins.append({"kind": "walk", "label": f"Walk win banked: {stats['movement_minutes']} movement minutes"})
+
+    exercise_goal = coach["exercise_goal"]
+    if exercise_goal["status"] == "met":
+        wins.append({"kind": "exercise_goal", "label": f"{exercise_goal['label']} goal met"})
+    elif exercise_goal["status"] == "close":
+        wins.append({"kind": "exercise_goal_close", "label": f"Close on {exercise_goal['label'].lower()} goal"})
 
     if zepbound["goal_status"]["shot_logged"]["status"] == "met":
         wins.append({"kind": "shot_logged", "label": "Shot logged today"})
@@ -940,16 +1247,99 @@ def format_zepbound_reply(report: dict[str, Any]) -> str:
     )
 
 
+def format_activity_observation_reply(client: FitbitClient, target_date: str) -> str:
+    coach = build_coach_report(client, target_date)
+    wins = build_daily_wins(client, target_date)
+    stats = coach["stats"]
+    step_goal = coach["goal_status"]["steps"]
+    exercise_goal = coach["exercise_goal"]
+    primary_goal = coach["primary_goal"]
+
+    if primary_goal["kind"] == "recovery_walk":
+        if primary_goal["status"] == "met":
+            wins_line = f" Wins today: {', '.join(item['label'] for item in wins)}." if wins else ""
+            return (
+                f"Yes, and this is exactly the kind of win I want to notice. Yesterday already had real training, "
+                f"so today’s right goal was a recovery walk, not more intensity. You got {primary_goal['actual']} "
+                f"movement minutes, which clears the goal cleanly.{wins_line}"
+            )
+        if primary_goal["status"] == "close":
+            return (
+                f"Yes. Yesterday was already a training day, so today’s smart goal is a recovery walk. "
+                f"You are close with {primary_goal['actual']} of {primary_goal['target']} movement minutes."
+            )
+
+    if stats["movement_minutes"] >= 30 or step_goal["status"] in {"met", "close"}:
+        opener = "Yes, I noticed."
+    elif stats["zone_minutes"] > 0:
+        opener = "Yes, your data shows exercise."
+    else:
+        opener = "Not really yet."
+
+    walk_line = (
+        f"You logged {stats['movement_minutes']} movement minutes and {stats['steps']} steps, which looks like a real walk rather than accidental shuffling."
+        if stats["movement_minutes"] >= 20
+        else f"You have {stats['steps']} steps and {stats['movement_minutes']} movement minutes so far."
+    )
+
+    if step_goal["status"] == "met":
+        goal_line = f"You met your step goal today: {step_goal['actual']} of {step_goal['target']}."
+    elif stats["movement_minutes"] >= 30:
+        goal_line = "That absolutely counts as a walking win today, even if it is not the full step goal."
+    elif step_goal["status"] == "close":
+        goal_line = f"You are close on the step goal at {step_goal['actual']} of {step_goal['target']}."
+    else:
+        goal_line = "It counts as useful movement, but not a formal goal hit yet."
+
+    exercise_line = (
+        f"Your combined exercise goal is also {exercise_goal['status'].replace('_', ' ')}, so the day counts even if the walk did not spike zone minutes."
+        if exercise_goal["status"] in {"met", "close"}
+        else "This still looks more like base movement than a full exercise hit, which is fine on a lighter day."
+    )
+    wins_line = f" Wins today: {', '.join(item['label'] for item in wins)}." if wins else ""
+    return f"{opener} {walk_line} {goal_line} {exercise_line}{wins_line}"
+
+
+def format_goal_check_reply(client: FitbitClient, target_date: str) -> str:
+    coach = build_coach_report(client, target_date)
+    wins = build_daily_wins(client, target_date)
+    step_goal = coach["goal_status"]["steps"]
+    exercise_goal = coach["exercise_goal"]
+    primary_goal = coach["primary_goal"]
+
+    if wins:
+        win_line = ", ".join(item["label"] for item in wins)
+        primary_line = (
+            f"Your main goal today was {primary_goal['label'].lower()} because {primary_goal['reason'].lower()}"
+            if primary_goal["status"] == "met"
+            else f"Your main goal today is {primary_goal['label'].lower()} because {primary_goal['reason'].lower()}"
+        )
+        return (
+            f"Yes. {primary_line} You already checked these boxes: {win_line}. "
+            f"Steps are {step_goal['actual']} of {step_goal['target']}, and your {exercise_goal['label'].lower()} status is {exercise_goal['status'].replace('_', ' ')}."
+        )
+
+    return (
+        f"Not yet. Your main goal today is {primary_goal['label'].lower()}, and the current score is "
+        f"{primary_goal['actual']} of {primary_goal['target']} {primary_goal['unit']}. "
+        f"Steps are {step_goal['actual']} of {step_goal['target']}, and your {exercise_goal['label'].lower()} status is "
+        f"{exercise_goal['status'].replace('_', ' ')}."
+    )
+
+
 def format_today_plan_reply(client: FitbitClient, target_date: str) -> str:
     coach = build_coach_report(client, target_date)
     fatloss = build_fatloss_report(client, target_date, 30)
     zepbound = build_zepbound_report(client, target_date)
     wins = build_daily_wins(client, target_date)
+    primary_goal = coach["primary_goal"]
     win_line = f" Wins today: {', '.join(item['label'] for item in wins)}." if wins else ""
+    shot_line = zepbound["goal_status"]["shot_logged"]["summary"]
     return (
         f"Today is a {coach['readiness']} day. {coach['prescription']} "
+        f"The main goal is {primary_goal['label'].lower()}: {primary_goal['reason']} "
         f"Your 30-day fat-loss read is {fatloss['verdict']}, so the priority is protecting lean mass while staying consistent. "
-        f"You are {zepbound['days_since_last_dose']} days past your last Zepbound dose, with about "
+        f"{shot_line}. You are {zepbound['days_since_last_dose']} days past your last Zepbound dose, with about "
         f"{zepbound['latest_entry']['estimated_amount_mg']} mg modeled in your system. "
         f"Action list: hit protein early, do some easy walking, and only push training if your body feels cooperative rather than negotiable.{win_line}"
     )
@@ -1007,6 +1397,12 @@ def build_llm_context(client: FitbitClient, prompt: str, target_date: str) -> di
     except Exception as exc:  # noqa: BLE001
         context["zepbound_error"] = str(exc)
 
+    if topic in {"water", "other"}:
+        try:
+            context["water"] = build_water_report(client, target_date)
+        except Exception as exc:  # noqa: BLE001
+            context["water_error"] = str(exc)
+
     if topic in {"fatloss", "tomorrow_plan", "today_plan", "other"}:
         try:
             context["fatloss"] = build_fatloss_report(client, target_date, 30)
@@ -1060,15 +1456,25 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
         return format_trends_reply(build_trends_report(client, target_date, 7))
     if topic == "coach":
         return format_coach_reply(build_coach_report(client, target_date))
+    if topic == "activity_observation":
+        return format_activity_observation_reply(client, target_date)
+    if topic == "goal_check":
+        return format_goal_check_reply(client, target_date)
+    if topic == "water":
+        amount_oz = parse_water_oz(text)
+        if amount_oz is not None:
+            return handle_water_sms_reply(client, prompt.strip(), target_date)
+        return format_water_reply(build_water_report(client, target_date))
     if topic == "help":
         return (
             "Try: 'What should I do today?', 'What should I aim to do tomorrow?', "
-            "'How is my 7-day trend?', 'Am I losing fat or lean mass?', or 'How many days since my shot?'"
+            "'How is my 7-day trend?', 'Am I losing fat or lean mass?', 'Did you notice I took a walk?', "
+            "'Did I meet my goals today?', or 'How is water going?'"
         )
     if topic == "empty":
-        return "Ask about training readiness, weekly trends, fat loss, body composition, or today."
+        return "Ask about training readiness, weekly trends, fat loss, body composition, water, or today."
     return (
-        "I didn't map that cleanly yet. Ask about today, training readiness, weekly trends, fat loss, or body composition."
+        "I didn't map that cleanly yet. Ask about today, training readiness, weekly trends, fat loss, water, or body composition."
     )
 
 
@@ -1076,6 +1482,35 @@ def detect_topic(text: str) -> str:
     text = text.strip().lower()
     if not text:
         return "empty"
+    if any(
+        phrase in text
+        for phrase in [
+            "did you notice i took a walk",
+            "did you notice my walk",
+            "did you see my walk",
+            "did you notice i went for a walk",
+            "did you notice i exercised",
+            "did you notice i worked out",
+            "did you notice i was active",
+            "did you see i was active",
+            "did you notice i took a class",
+            "did you notice i did an exercise class",
+        ]
+    ):
+        return "activity_observation"
+    if any(
+        phrase in text
+        for phrase in [
+            "did i meet my goals",
+            "have i met my goals",
+            "did i hit my goals",
+            "what goals did i meet",
+            "what have i already done well",
+            "what wins do i have",
+            "wins today",
+        ]
+    ):
+        return "goal_check"
     if any(
         phrase in text
         for phrase in [
@@ -1097,6 +1532,8 @@ def detect_topic(text: str) -> str:
         return "tomorrow_plan"
     if any(phrase in text for phrase in ["what should i do today", "today plan", "plan for today", "what now"]):
         return "today_plan"
+    if "water" in text or "hydration" in text or parse_water_oz(text) is not None:
+        return "water"
     if any(word in text for word in ["zepbound", "shot", "dose", "dosing", "glp", "medication"]):
         return "zepbound"
     if any(word in text for word in ["fat", "lean", "body comp", "bodycomp", "muscle"]):
@@ -1218,6 +1655,37 @@ def run_fatloss(client: FitbitClient, end_date: str, days: int) -> None:
     print(json.dumps(build_fatloss_report(client, end_date, days), indent=2))
 
 
+def run_water(client: FitbitClient, target_date: str, warm_day: bool) -> None:
+    print(json.dumps(build_water_report(client, target_date, warm_day=warm_day), indent=2))
+
+
+def run_log_water(client: FitbitClient, target_date: str, amount_oz: float, source: str, note: str | None) -> None:
+    client.add_water_intake(target_date, amount_oz, source=source, note=note)
+    print(json.dumps(build_water_report(client, target_date), indent=2))
+
+
+def run_water_reminder(client: FitbitClient, target_date: str, window: str, warm_day: bool, send: bool) -> None:
+    reminder = build_water_sms_prompt(client, target_date, window=window, warm_day=warm_day)
+    payload: dict[str, Any] = {
+        "message": reminder["message"],
+        "window": window,
+        "date": target_date,
+        "sent": False,
+        "send": reminder["send"],
+        "reason": reminder["reason"],
+    }
+    if send and reminder["send"] and reminder["message"]:
+        sms_payload = client.send_sms(reminder["message"])
+        payload["sent"] = True
+        payload["sid"] = sms_payload.get("sid")
+    print(json.dumps(payload, indent=2))
+
+
+def run_water_reply(client: FitbitClient, target_date: str, body: str) -> None:
+    reply = handle_water_sms_reply(client, body, target_date)
+    print(json.dumps({"reply": reply, "report": build_water_report(client, target_date)}, indent=2))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fitbit CLI for recovery-first coaching workflows")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1255,6 +1723,26 @@ def parse_args() -> argparse.Namespace:
     chat_parser = subparsers.add_parser("chat", help="Start a conversational coach interface in the terminal")
     chat_parser.add_argument("--date", default=str(date.today()), help="Reference date in YYYY-MM-DD format")
 
+    water_parser = subparsers.add_parser("water", help="Show hydration progress and target range")
+    water_parser.add_argument("--date", default=str(date.today()), help="Reference date in YYYY-MM-DD format")
+    water_parser.add_argument("--warm-day", action="store_true", help="Apply the warm-weather hydration bonus")
+
+    log_water_parser = subparsers.add_parser("log-water", help="Log a water intake entry")
+    log_water_parser.add_argument("amount_oz", type=float, help="Water amount in ounces")
+    log_water_parser.add_argument("--date", default=str(date.today()), help="Reference date in YYYY-MM-DD format")
+    log_water_parser.add_argument("--source", default="manual", help="Source label for this entry")
+    log_water_parser.add_argument("--note", default=None, help="Optional note stored with the entry")
+
+    water_reminder_parser = subparsers.add_parser("water-reminder", help="Build or send a water reminder SMS")
+    water_reminder_parser.add_argument("--date", default=str(date.today()), help="Reference date in YYYY-MM-DD format")
+    water_reminder_parser.add_argument("--window", choices=["noon", "evening"], required=True)
+    water_reminder_parser.add_argument("--warm-day", action="store_true", help="Apply the warm-weather hydration bonus")
+    water_reminder_parser.add_argument("--send", action="store_true", help="Send the reminder via Twilio instead of only printing it")
+
+    water_reply_parser = subparsers.add_parser("water-reply", help="Parse an SMS-style water reply and log it")
+    water_reply_parser.add_argument("body", help="Incoming message body, for example '24 oz'")
+    water_reply_parser.add_argument("--date", default=str(date.today()), help="Reference date in YYYY-MM-DD format")
+
     return parser.parse_args()
 
 
@@ -1283,6 +1771,14 @@ def main() -> None:
         run_zepbound(client, args.date)
     elif args.command == "chat":
         run_chat(client, args.date)
+    elif args.command == "water":
+        run_water(client, args.date, args.warm_day)
+    elif args.command == "log-water":
+        run_log_water(client, args.date, args.amount_oz, args.source, args.note)
+    elif args.command == "water-reminder":
+        run_water_reminder(client, args.date, args.window, args.warm_day, args.send)
+    elif args.command == "water-reply":
+        run_water_reply(client, args.date, args.body)
     else:
         raise ValueError(f"Unknown command {args.command}")
 

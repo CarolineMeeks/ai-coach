@@ -67,14 +67,39 @@ class CoachDB:
                     user_id INTEGER PRIMARY KEY,
                     step_goal INTEGER NOT NULL DEFAULT 5000,
                     zone_min_goal INTEGER NOT NULL DEFAULT 30,
+                    water_goal_min_oz INTEGER NOT NULL DEFAULT 80,
+                    water_goal_max_oz INTEGER NOT NULL DEFAULT 100,
+                    water_goal_active_bonus_oz INTEGER NOT NULL DEFAULT 12,
+                    water_goal_warm_bonus_oz INTEGER NOT NULL DEFAULT 12,
                     weigh_in_required INTEGER NOT NULL DEFAULT 1,
                     shot_logging_required INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS water_intake_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    log_date TEXT NOT NULL,
+                    amount_oz REAL NOT NULL,
+                    source TEXT,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                );
                 """
             )
+            self._ensure_column(connection, "user_goals", "water_goal_min_oz", "INTEGER NOT NULL DEFAULT 80")
+            self._ensure_column(connection, "user_goals", "water_goal_max_oz", "INTEGER NOT NULL DEFAULT 100")
+            self._ensure_column(connection, "user_goals", "water_goal_active_bonus_oz", "INTEGER NOT NULL DEFAULT 12")
+            self._ensure_column(connection, "user_goals", "water_goal_warm_bonus_oz", "INTEGER NOT NULL DEFAULT 12")
+
+    def _ensure_column(self, connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        if any(str(row["name"]) == column for row in rows):
+            return
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def ensure_user(self, slug: str) -> CoachUser:
         now = datetime.now(timezone.utc).isoformat()
@@ -91,8 +116,10 @@ class CoachDB:
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO user_goals (
-                        user_id, step_goal, zone_min_goal, weigh_in_required, shot_logging_required, created_at, updated_at
-                    ) VALUES (?, 5000, 30, 1, 1, ?, ?)
+                        user_id, step_goal, zone_min_goal, water_goal_min_oz, water_goal_max_oz,
+                        water_goal_active_bonus_oz, water_goal_warm_bonus_oz,
+                        weigh_in_required, shot_logging_required, created_at, updated_at
+                    ) VALUES (?, 5000, 30, 80, 100, 12, 12, 1, 1, ?, ?)
                     """,
                     (int(row["id"]), now, now),
                 )
@@ -172,7 +199,9 @@ class CoachDB:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT step_goal, zone_min_goal, weigh_in_required, shot_logging_required
+                SELECT step_goal, zone_min_goal, water_goal_min_oz, water_goal_max_oz,
+                       water_goal_active_bonus_oz, water_goal_warm_bonus_oz,
+                       weigh_in_required, shot_logging_required
                 FROM user_goals
                 WHERE user_id = ?
                 """,
@@ -183,9 +212,56 @@ class CoachDB:
         return {
             "step_goal": int(row["step_goal"]),
             "zone_min_goal": int(row["zone_min_goal"]),
+            "water_goal_min_oz": int(row["water_goal_min_oz"]),
+            "water_goal_max_oz": int(row["water_goal_max_oz"]),
+            "water_goal_active_bonus_oz": int(row["water_goal_active_bonus_oz"]),
+            "water_goal_warm_bonus_oz": int(row["water_goal_warm_bonus_oz"]),
             "weigh_in_required": bool(row["weigh_in_required"]),
             "shot_logging_required": bool(row["shot_logging_required"]),
         }
+
+    def add_water_intake(
+        self,
+        user_id: int,
+        log_date: str,
+        amount_oz: float,
+        source: str = "manual",
+        note: str | None = None,
+    ) -> None:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO water_intake_logs (user_id, log_date, amount_oz, source, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, log_date, amount_oz, source, note, created_at),
+            )
+
+    def get_water_intake_logs(self, user_id: int, log_date: str) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, log_date, amount_oz, source, note, created_at
+                FROM water_intake_logs
+                WHERE user_id = ? AND log_date = ?
+                ORDER BY id ASC
+                """,
+                (user_id, log_date),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_water_total(self, user_id: int, log_date: str) -> float:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(SUM(amount_oz), 0) AS total_oz
+                FROM water_intake_logs
+                WHERE user_id = ? AND log_date = ?
+                """,
+                (user_id, log_date),
+            ).fetchone()
+        return round(float(row["total_oz"]) if row and row["total_oz"] is not None else 0.0, 1)
 
     def migrate_legacy_token_file(self, user_id: int, token_path: Path) -> bool:
         if self.get_fitbit_tokens(user_id) is not None or not token_path.exists():

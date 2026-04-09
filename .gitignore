@@ -5,3 +5,5 @@ __pycache__/
 .fitbit_tokens.json
 coach_interactions.jsonl
 coach.db
+.DS_Store
+.env~

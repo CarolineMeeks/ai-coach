@@ -13,7 +13,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from fitbit_client import FitbitClient, FitbitConfig, answer_chat, build_coach_report, build_fatloss_report, build_trends_report, build_zepbound_report, detect_topic
+from fitbit_client import (
+    FitbitClient,
+    FitbitConfig,
+    answer_chat,
+    build_coach_report,
+    build_fatloss_report,
+    build_trends_report,
+    build_water_report,
+    build_water_sms_prompt,
+    build_zepbound_report,
+    detect_topic,
+    handle_water_sms_reply,
+)
 
 
 STATIC_DIR = Path(__file__).with_name("web")
@@ -223,6 +235,36 @@ def make_handler(client: FitbitClient):
                     return
                 self._send_json(payload)
                 return
+            if route == "/api/water":
+                warm_day = query.get("warm", ["0"])[0] in {"1", "true", "yes"}
+                try:
+                    client.reset_cache_events()
+                    payload = with_cache_status(
+                        client,
+                        {
+                            "date": target_date,
+                            "water": build_water_report(client, target_date, warm_day=warm_day),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"ERROR /api/water: {exc}")
+                    self._log(traceback.format_exc())
+                    self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                self._send_json(payload)
+                return
+            if route == "/api/sms/water-reminder":
+                warm_day = query.get("warm", ["0"])[0] in {"1", "true", "yes"}
+                window = query.get("window", ["noon"])[0]
+                try:
+                    reminder = build_water_sms_prompt(client, target_date, window=window, warm_day=warm_day)
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"ERROR /api/sms/water-reminder: {exc}")
+                    self._log(traceback.format_exc())
+                    self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                self._send_json({"date": target_date, "window": window, **reminder})
+                return
             if route == "/api/history":
                 limit = int(query.get("limit", ["30"])[0])
                 payload = {
@@ -235,6 +277,52 @@ def make_handler(client: FitbitClient):
 
         def do_POST(self) -> None:  # noqa: N802
             parsed = urlparse(self.path)
+            if parsed.path == "/sms/webhook":
+                content_length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(content_length).decode("utf-8")
+                form = parse_qs(raw)
+                body = str(form.get("Body", [""])[0])
+                target_date = str(form.get("Date", [date.today().isoformat()])[0])
+                reply = handle_water_sms_reply(client, body, target_date)
+                client.append_interaction(
+                    {
+                        "source": "sms",
+                        "topic": "water",
+                        "date_context": target_date,
+                        "message": body,
+                        "reply": reply,
+                    },
+                )
+                response_body = f"<Response><Message>{reply}</Message></Response>".encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/xml; charset=utf-8")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+                return
+
+            if parsed.path == "/api/water":
+                content_length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(content_length)
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except json.JSONDecodeError:
+                    self._send_json({"error": "Invalid JSON body."}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                try:
+                    amount_oz = float(payload.get("amount_oz"))
+                except (TypeError, ValueError):
+                    self._send_json({"error": "amount_oz is required and must be numeric."}, HTTPStatus.BAD_REQUEST)
+                    return
+
+                target_date = str(payload.get("date", date.today()))
+                note = str(payload.get("note", "")).strip() or None
+                source = str(payload.get("source", "web-water"))
+                client.add_water_intake(target_date, amount_oz, source=source, note=note)
+                self._send_json({"water": build_water_report(client, target_date)})
+                return
+
             if parsed.path != "/api/chat":
                 self.send_error(HTTPStatus.NOT_FOUND, "Not found")
                 return
