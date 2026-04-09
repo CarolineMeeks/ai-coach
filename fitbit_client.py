@@ -23,7 +23,7 @@ from typing import Any
 
 import requests
 
-from interaction_log import DEFAULT_LOG_PATH, append_interaction
+from app_db import DEFAULT_DB_PATH, CoachDB, CoachUser
 
 
 AUTH_URL = "https://www.fitbit.com/oauth2/authorize"
@@ -47,9 +47,11 @@ class FitbitConfig:
     client_id: str
     client_secret: str
     redirect_uri: str
+    database_path: Path
+    user_slug: str
     token_path: Path
     zepbound_sheet_url: str | None = None
-    interaction_log_path: Path = DEFAULT_LOG_PATH
+    interaction_log_path: Path = Path("coach_interactions.jsonl")
     openai_api_key: str | None = None
     openai_model: str = "gpt-5.4-mini"
     openai_base_url: str = "https://api.openai.com/v1"
@@ -59,10 +61,12 @@ class FitbitConfig:
         client_id = os.getenv("FITBIT_CLIENT_ID", "").strip()
         client_secret = os.getenv("FITBIT_CLIENT_SECRET", "").strip()
         redirect_uri = os.getenv("FITBIT_REDIRECT_URI", "http://127.0.0.1:8765/callback").strip()
+        database_path = Path(os.getenv("COACH_DB_PATH", str(DEFAULT_DB_PATH))).expanduser()
+        user_slug = os.getenv("COACH_USER_SLUG", "default").strip() or "default"
         token_path = Path(os.getenv("FITBIT_TOKEN_PATH", ".fitbit_tokens.json")).expanduser()
         zepbound_sheet_url = os.getenv("ZEPBOUND_SHEET_URL", "").strip() or None
         interaction_log_path = Path(
-            os.getenv("COACH_INTERACTION_LOG_PATH", str(DEFAULT_LOG_PATH))
+            os.getenv("COACH_INTERACTION_LOG_PATH", "coach_interactions.jsonl")
         ).expanduser()
         openai_api_key = os.getenv("OPENAI_API_KEY", "").strip() or None
         openai_model = os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
@@ -83,6 +87,8 @@ class FitbitConfig:
             client_id=client_id,
             client_secret=client_secret,
             redirect_uri=redirect_uri,
+            database_path=database_path,
+            user_slug=user_slug,
             token_path=token_path,
             zepbound_sheet_url=zepbound_sheet_url,
             interaction_log_path=interaction_log_path,
@@ -93,24 +99,29 @@ class FitbitConfig:
 
 
 class TokenStore:
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    def __init__(self, db: CoachDB, user: CoachUser, legacy_path: Path) -> None:
+        self.db = db
+        self.user = user
+        self.legacy_path = legacy_path
 
     def load(self) -> dict[str, Any]:
-        if not self.path.exists():
-            raise FitbitConfigError(
-                f"Token file not found at {self.path}. Run the 'auth' command first."
-            )
-        return json.loads(self.path.read_text())
+        payload = self.db.get_fitbit_tokens(self.user.id)
+        if payload is None:
+            raise FitbitConfigError("Fitbit tokens not found in the app database. Run the auth command first.")
+        return payload
 
     def save(self, payload: dict[str, Any]) -> None:
-        self.path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        self.db.save_fitbit_tokens(self.user.id, payload)
 
 
 class FitbitClient:
     def __init__(self, config: FitbitConfig) -> None:
         self.config = config
-        self.tokens = TokenStore(config.token_path)
+        self.db = CoachDB(config.database_path)
+        self.user = self.db.ensure_user(config.user_slug)
+        self.db.migrate_legacy_token_file(self.user.id, config.token_path)
+        self.db.migrate_legacy_interaction_log(self.user.id, config.interaction_log_path)
+        self.tokens = TokenStore(self.db, self.user, config.token_path)
         self._access_token_payload: dict[str, Any] | None = None
         self._response_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
         self._cache_events: list[dict[str, str]] = []
@@ -303,6 +314,15 @@ class FitbitClient:
                     return str(text).strip()
         raise FitbitConfigError("OpenAI response did not include output text.")
 
+    def append_interaction(self, record: dict[str, Any]) -> None:
+        self.db.append_interaction(self.user.id, record)
+
+    def read_recent_interactions(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self.db.read_recent_interactions(self.user.id, limit=limit)
+
+    def get_user_goals(self) -> dict[str, Any]:
+        return self.db.get_user_goals(self.user.id)
+
 
 def get_day_snapshot(client: FitbitClient, target_date: str) -> dict[str, Any]:
     activity = client.get_json(f"/1/user/-/activities/date/{target_date}.json")
@@ -341,11 +361,8 @@ def summarize_day(snapshot: dict[str, Any]) -> dict[str, Any]:
     light_minutes = int(summary.get("lightlyActiveMinutes", 0))
     sedentary_minutes = int(summary.get("sedentaryMinutes", 0))
     resting_hr = summary.get("restingHeartRate")
-    azm_entry = (
-        snapshot.get("active_zone_minutes", {})
-        .get("activities-active-zone-minutes", [{}])[0]
-        .get("value", {})
-    )
+    azm_items = snapshot.get("active_zone_minutes", {}).get("activities-active-zone-minutes", [])
+    azm_entry = azm_items[0].get("value", {}) if azm_items else {}
     zone_minutes = int(azm_entry.get("activeZoneMinutes", 0) or 0)
     fat_burn_zone_minutes = int(azm_entry.get("fatBurnActiveZoneMinutes", 0) or 0)
     cardio_zone_minutes = int(azm_entry.get("cardioActiveZoneMinutes", 0) or 0)
@@ -585,10 +602,26 @@ def run_bodycomp(client: FitbitClient, end_date: str, days: int) -> None:
 def build_coach_report(client: FitbitClient, target_date: str) -> dict[str, Any]:
     day = summarize_day(get_day_snapshot(client, target_date))
     coaching = coach_day(day)
+    goals = client.get_user_goals()
+
+    goal_status = {
+        "steps": {
+            "target": goals["step_goal"],
+            "actual": day["steps"],
+            "status": "met" if day["steps"] >= goals["step_goal"] else "close" if day["steps"] >= goals["step_goal"] * 0.8 else "not_met",
+        },
+        "zone_minutes": {
+            "target": goals["zone_min_goal"],
+            "actual": day["zone_minutes"],
+            "status": "met" if day["zone_minutes"] >= goals["zone_min_goal"] else "close" if day["zone_minutes"] >= goals["zone_min_goal"] * 0.67 else "not_met",
+        },
+    }
+
     return {
         "date": target_date,
         "readiness": coaching["readiness"],
         "prescription": coaching["prescription"],
+        "goal_status": goal_status,
         "stats": {
             "steps": day["steps"],
             "step_goal": day["step_goal"],
@@ -741,6 +774,7 @@ def build_fatloss_report(client: FitbitClient, end_date: str, days: int) -> dict
 
 
 def build_zepbound_report(client: FitbitClient, target_date: str) -> dict[str, Any]:
+    goals = client.get_user_goals()
     sheet_url = client.config.zepbound_sheet_url
     if not sheet_url:
         raise FitbitConfigError("Missing ZEPBOUND_SHEET_URL in the environment.")
@@ -813,9 +847,43 @@ def build_zepbound_report(client: FitbitClient, target_date: str) -> dict[str, A
         "last_dose": last_dose,
         "days_since_last_dose": days_since_last_dose,
         "days_between_last_two_doses": days_between_last_two,
+        "goal_status": {
+            "shot_logged": {
+                "required": goals["shot_logging_required"],
+                "actual": bool(last_dose and last_dose["date"] == target_date),
+                "status": "met" if not goals["shot_logging_required"] or (last_dose and last_dose["date"] == target_date) else "not_met",
+            }
+        },
         "coach_notes": coach_notes,
         "source_csv_url": csv_url,
     }
+
+
+def build_daily_wins(client: FitbitClient, target_date: str) -> list[dict[str, Any]]:
+    coach = build_coach_report(client, target_date)
+    zepbound = build_zepbound_report(client, target_date)
+    bodycomp = build_bodycomp_report(client, target_date, 1)
+
+    wins: list[dict[str, Any]] = []
+    step_goal = coach["goal_status"]["steps"]
+    if step_goal["status"] == "met":
+        wins.append({"kind": "steps", "label": f"Step goal met: {step_goal['actual']} / {step_goal['target']}"})
+    elif step_goal["status"] == "close":
+        wins.append({"kind": "steps_close", "label": f"Close on steps: {step_goal['actual']} / {step_goal['target']}"})
+
+    zone_goal = coach["goal_status"]["zone_minutes"]
+    if zone_goal["status"] == "met":
+        wins.append({"kind": "zone_minutes", "label": f"Exercise goal met: {zone_goal['actual']} / {zone_goal['target']} zone minutes"})
+    elif zone_goal["status"] == "close":
+        wins.append({"kind": "zone_minutes_close", "label": f"Close on exercise: {zone_goal['actual']} / {zone_goal['target']} zone minutes"})
+
+    if zepbound["goal_status"]["shot_logged"]["status"] == "met":
+        wins.append({"kind": "shot_logged", "label": "Shot logged today"})
+
+    if bodycomp["latest"] and bodycomp["latest"]["date"] == target_date:
+        wins.append({"kind": "weigh_in", "label": "Weigh-in logged today"})
+
+    return wins
 
 
 def format_coach_reply(report: dict[str, Any]) -> str:
@@ -860,10 +928,14 @@ def format_zepbound_reply(report: dict[str, Any]) -> str:
     latest = report["latest_entry"]
     last_dose = report["last_dose"] or {}
     notes = " ".join(report["coach_notes"])
+    if report["days_since_last_dose"] == 0:
+        timing = "Today is shot day."
+    else:
+        timing = f"That was {report['days_since_last_dose']} days ago."
     return (
         f"As of {report['date']}, your modeled Zepbound amount in system is {latest.get('estimated_amount_mg')} mg. "
         f"Last recorded dose was {last_dose.get('dose_administered_mg')} mg on {last_dose.get('date')}, "
-        f"which is {report['days_since_last_dose']} days ago. "
+        f"{timing} "
         f"The last logged note was {latest.get('note') or 'none'}. {notes}"
     )
 
@@ -872,12 +944,14 @@ def format_today_plan_reply(client: FitbitClient, target_date: str) -> str:
     coach = build_coach_report(client, target_date)
     fatloss = build_fatloss_report(client, target_date, 30)
     zepbound = build_zepbound_report(client, target_date)
+    wins = build_daily_wins(client, target_date)
+    win_line = f" Wins today: {', '.join(item['label'] for item in wins)}." if wins else ""
     return (
         f"Today is a {coach['readiness']} day. {coach['prescription']} "
         f"Your 30-day fat-loss read is {fatloss['verdict']}, so the priority is protecting lean mass while staying consistent. "
         f"You are {zepbound['days_since_last_dose']} days past your last Zepbound dose, with about "
         f"{zepbound['latest_entry']['estimated_amount_mg']} mg modeled in your system. "
-        "Action list: hit protein early, do some easy walking, and only push training if your body feels cooperative rather than negotiable."
+        f"Action list: hit protein early, do some easy walking, and only push training if your body feels cooperative rather than negotiable.{win_line}"
     )
 
 
@@ -1047,8 +1121,7 @@ def run_chat(client: FitbitClient, target_date: str) -> None:
         if prompt.lower() in {"exit", "quit"}:
             break
         reply = answer_chat(client, prompt, target_date)
-        append_interaction(
-            client.config.interaction_log_path,
+        client.append_interaction(
             {
                 "source": "terminal-chat",
                 "topic": detect_topic(prompt.strip().lower()),

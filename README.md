@@ -89,7 +89,31 @@ The browser UI shows:
 - body composition and Zepbound snapshot metrics
 - quick question buttons
 - a plain-English chat interface backed by the same coaching logic as the CLI
-- a recent interaction history panel loaded from `coach_interactions.jsonl`
+- a recent interaction history panel loaded from the SQLite app database
+
+## App database
+
+The app now stores its primary state in SQLite:
+
+- Fitbit tokens
+- interaction history
+- the default coach user record
+
+Default database path:
+
+- `coach.db`
+
+Recommended env vars:
+
+- `COACH_DB_PATH=coach.db`
+- `COACH_USER_SLUG=default`
+
+Legacy file paths are still supported as one-time migration inputs:
+
+- `FITBIT_TOKEN_PATH`
+- `COACH_INTERACTION_LOG_PATH`
+
+If those legacy files exist and the database is empty, the app imports them into SQLite on startup.
 
 The app also uses short-lived in-memory caching to avoid hammering Fitbit:
 
@@ -102,6 +126,7 @@ The app also uses short-lived in-memory caching to avoid hammering Fitbit:
 For a deployed app, set:
 
 - `FITBIT_REDIRECT_URI=https://your-app.onrender.com/callback`
+- `COACH_DB_PATH=/var/data/coach.db` on a platform with persistent disk
 
 Then visit:
 
@@ -111,13 +136,7 @@ That route starts Fitbit OAuth and saves tokens when Fitbit redirects back to `/
 
 ## Interaction history
 
-Every terminal or browser chat exchange is appended to a local JSONL log file:
-
-- `coach_interactions.jsonl`
-
-You can override the path with:
-
-- `COACH_INTERACTION_LOG_PATH`
+Every terminal or browser chat exchange is now stored in the SQLite app database.
 
 Each record includes:
 

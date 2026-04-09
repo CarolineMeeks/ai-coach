@@ -14,7 +14,6 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from fitbit_client import FitbitClient, FitbitConfig, answer_chat, build_coach_report, build_fatloss_report, build_trends_report, build_zepbound_report, detect_topic
-from interaction_log import append_interaction, read_recent_interactions
 
 
 STATIC_DIR = Path(__file__).with_name("web")
@@ -227,7 +226,7 @@ def make_handler(client: FitbitClient):
             if route == "/api/history":
                 limit = int(query.get("limit", ["30"])[0])
                 payload = {
-                    "items": read_recent_interactions(client.config.interaction_log_path, limit=limit)
+                    "items": client.read_recent_interactions(limit=limit)
                 }
                 self._send_json(payload)
                 return
@@ -261,8 +260,7 @@ def make_handler(client: FitbitClient):
                 self._log(traceback.format_exc())
                 self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
-            append_interaction(
-                client.config.interaction_log_path,
+            client.append_interaction(
                 {
                     "source": "web-chat",
                     "topic": detect_topic(prompt),

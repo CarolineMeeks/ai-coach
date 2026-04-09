@@ -57,12 +57,17 @@ function setSummary(payload) {
   const readiness = payload.coach.readiness;
   const prescription = payload.coach.prescription;
   const fatloss = state.fatloss?.verdict || "loading";
-  const daysSinceDose = state.zepbound?.days_since_last_dose ?? "loading";
+  let zepboundText = "loading";
+  if (state.zepbound) {
+    zepboundText = state.zepbound.days_since_last_dose === 0
+      ? "Today is shot day"
+      : `${state.zepbound.days_since_last_dose} day(s) since last shot`;
+  }
   summaryCard.innerHTML = `
     <p class="label">Today</p>
     <h2>${readiness.toUpperCase()}</h2>
     <p>${prescription}</p>
-    <p class="meta">Fat-loss read: ${fatloss}. Zepbound: ${daysSinceDose} day(s) since last shot.</p>
+    <p class="meta">Fat-loss read: ${fatloss}. Zepbound: ${zepboundText}.</p>
   `;
   const cache = payload.cache_status;
   cacheBanner.hidden = false;
