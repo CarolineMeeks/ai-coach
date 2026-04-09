@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import traceback
 import secrets
 from datetime import date
 from http import HTTPStatus
@@ -71,6 +72,9 @@ def with_cache_status(client: FitbitClient, payload: dict) -> dict:
 
 def make_handler(client: FitbitClient):
     class CoachHandler(BaseHTTPRequestHandler):
+        def _log(self, message: str) -> None:
+            print(message, flush=True)
+
         def _send_json(self, payload: dict, status: int = HTTPStatus.OK) -> None:
             body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
@@ -92,6 +96,7 @@ def make_handler(client: FitbitClient):
             route = parsed.path
             query = parse_qs(parsed.query)
             target_date = query.get("date", [str(date.today())])[0]
+            self._log(f"GET {route} date={target_date}")
 
             if route == "/":
                 self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
@@ -145,6 +150,8 @@ def make_handler(client: FitbitClient):
                 try:
                     payload = load_status_payload(client, target_date)
                 except Exception as exc:  # noqa: BLE001
+                    self._log(f"ERROR /api/status: {exc}")
+                    self._log(traceback.format_exc())
                     self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
                 self._send_json(payload)
@@ -160,6 +167,8 @@ def make_handler(client: FitbitClient):
                         },
                     )
                 except Exception as exc:  # noqa: BLE001
+                    self._log(f"ERROR /api/today: {exc}")
+                    self._log(traceback.format_exc())
                     self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
                 self._send_json(payload)
@@ -175,6 +184,8 @@ def make_handler(client: FitbitClient):
                         },
                     )
                 except Exception as exc:  # noqa: BLE001
+                    self._log(f"ERROR /api/trends: {exc}")
+                    self._log(traceback.format_exc())
                     self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
                 self._send_json(payload)
@@ -190,6 +201,8 @@ def make_handler(client: FitbitClient):
                         },
                     )
                 except Exception as exc:  # noqa: BLE001
+                    self._log(f"ERROR /api/fatloss: {exc}")
+                    self._log(traceback.format_exc())
                     self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
                 self._send_json(payload)
@@ -205,6 +218,8 @@ def make_handler(client: FitbitClient):
                         },
                     )
                 except Exception as exc:  # noqa: BLE001
+                    self._log(f"ERROR /api/zepbound: {exc}")
+                    self._log(traceback.format_exc())
                     self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return
                 self._send_json(payload)
@@ -242,6 +257,8 @@ def make_handler(client: FitbitClient):
             try:
                 reply = answer_chat(client, prompt, target_date)
             except Exception as exc:  # noqa: BLE001
+                self._log(f"ERROR /api/chat: {exc}")
+                self._log(traceback.format_exc())
                 self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
             append_interaction(
