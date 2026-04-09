@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.parse
 import webbrowser
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -49,6 +50,9 @@ class FitbitConfig:
     token_path: Path
     zepbound_sheet_url: str | None = None
     interaction_log_path: Path = DEFAULT_LOG_PATH
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-5.4-mini"
+    openai_base_url: str = "https://api.openai.com/v1"
 
     @classmethod
     def from_env(cls) -> "FitbitConfig":
@@ -60,6 +64,9 @@ class FitbitConfig:
         interaction_log_path = Path(
             os.getenv("COACH_INTERACTION_LOG_PATH", str(DEFAULT_LOG_PATH))
         ).expanduser()
+        openai_api_key = os.getenv("OPENAI_API_KEY", "").strip() or None
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
+        openai_base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1"
 
         missing = [
             name
@@ -79,6 +86,9 @@ class FitbitConfig:
             token_path=token_path,
             zepbound_sheet_url=zepbound_sheet_url,
             interaction_log_path=interaction_log_path,
+            openai_api_key=openai_api_key,
+            openai_model=openai_model,
+            openai_base_url=openai_base_url,
         )
 
 
@@ -101,6 +111,9 @@ class FitbitClient:
     def __init__(self, config: FitbitConfig) -> None:
         self.config = config
         self.tokens = TokenStore(config.token_path)
+        self._access_token_payload: dict[str, Any] | None = None
+        self._response_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
+        self._cache_events: list[dict[str, str]] = []
 
     def _basic_auth_header(self) -> str:
         raw = f"{self.config.client_id}:{self.config.client_secret}".encode("utf-8")
@@ -160,33 +173,135 @@ class FitbitClient:
         fresh_payload = response.json()
         fresh_payload["saved_at"] = int(time.time())
         self.tokens.save(fresh_payload)
+        self._access_token_payload = fresh_payload
         return fresh_payload
 
     def access_token(self) -> str:
-        payload = self.refresh_access_token()
+        payload = self._access_token_payload or self.tokens.load()
+        saved_at = int(payload.get("saved_at", 0) or 0)
+        expires_in = int(payload.get("expires_in", 0) or 0)
+        now = int(time.time())
+        refresh_needed = not payload.get("access_token")
+        if expires_in and saved_at:
+            refresh_needed = refresh_needed or now >= (saved_at + expires_in - 60)
+        if refresh_needed:
+            payload = self.refresh_access_token()
+        else:
+            self._access_token_payload = payload
         token = payload.get("access_token")
         if not token:
             raise FitbitConfigError("No access_token returned by Fitbit.")
         return token
 
+    def _cache_key(self, kind: str, target: str, params: dict[str, Any] | None = None) -> tuple[str, str, str]:
+        serialized = json.dumps(params or {}, sort_keys=True, separators=(",", ":"))
+        return (kind, target, serialized)
+
+    def _get_cached(self, key: tuple[str, str, str], allow_stale: bool = False) -> Any | None:
+        cached = self._response_cache.get(key)
+        if not cached:
+            return None
+        expires_at, payload = cached
+        if not allow_stale and time.time() >= expires_at:
+            return None
+        return deepcopy(payload)
+
+    def reset_cache_events(self) -> None:
+        self._cache_events = []
+
+    def consume_cache_events(self) -> list[dict[str, str]]:
+        events = self._cache_events[:]
+        self._cache_events = []
+        return events
+
+    def _set_cached(self, key: tuple[str, str, str], payload: Any, ttl_seconds: int) -> Any:
+        self._response_cache[key] = (time.time() + ttl_seconds, deepcopy(payload))
+        return deepcopy(payload)
+
     def get_json(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        key = self._cache_key("json", endpoint, params)
+        cached = self._get_cached(key)
+        if cached is not None:
+            self._cache_events.append({"kind": "cache", "target": endpoint})
+            return cached
         token = self.access_token()
-        response = requests.get(
-            f"{API_BASE_URL}{endpoint}",
-            headers={"Authorization": f"Bearer {token}"},
-            params=params,
-            timeout=30,
-        )
-        response.raise_for_status()
-        return response.json()
+        try:
+            response = requests.get(
+                f"{API_BASE_URL}{endpoint}",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.HTTPError:
+            if response.status_code == 429:
+                stale = self._get_cached(key, allow_stale=True)
+                if stale is not None:
+                    self._cache_events.append({"kind": "stale", "target": endpoint})
+                    return stale
+            raise
+        payload = response.json()
+        return self._set_cached(key, payload, ttl_seconds=300)
 
     def get_text(self, url: str) -> str:
-        response = requests.get(
-            url,
-            timeout=30,
+        key = self._cache_key("text", url)
+        cached = self._get_cached(key)
+        if cached is not None:
+            self._cache_events.append({"kind": "cache", "target": url})
+            return cached
+        try:
+            response = requests.get(
+                url,
+                timeout=30,
+            )
+            response.raise_for_status()
+        except requests.HTTPError:
+            if response.status_code == 429:
+                stale = self._get_cached(key, allow_stale=True)
+                if stale is not None:
+                    self._cache_events.append({"kind": "stale", "target": url})
+                    return stale
+            raise
+        return self._set_cached(key, response.text, ttl_seconds=900)
+
+    def openai_response(self, system_prompt: str, user_prompt: str) -> str:
+        if not self.config.openai_api_key:
+            raise FitbitConfigError("Missing OPENAI_API_KEY in the environment.")
+
+        response = requests.post(
+            f"{self.config.openai_base_url.rstrip('/')}/responses",
+            headers={
+                "Authorization": f"Bearer {self.config.openai_api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": self.config.openai_model,
+                "reasoning": {"effort": "low"},
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": system_prompt}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_prompt}],
+                    },
+                ],
+            },
+            timeout=60,
         )
         response.raise_for_status()
-        return response.text
+        payload = response.json()
+        if payload.get("output_text"):
+            return str(payload["output_text"]).strip()
+
+        outputs = payload.get("output", [])
+        for item in outputs:
+            for content in item.get("content", []):
+                text = content.get("text")
+                if text:
+                    return str(text).strip()
+        raise FitbitConfigError("OpenAI response did not include output text.")
 
 
 def get_day_snapshot(client: FitbitClient, target_date: str) -> dict[str, Any]:
@@ -554,6 +669,22 @@ def build_trends_report(client: FitbitClient, end_date: str, days: int) -> dict[
 def build_fatloss_report(client: FitbitClient, end_date: str, days: int) -> dict[str, Any]:
     bodycomp = build_bodycomp_report(client, end_date, days)
     daily = bodycomp["daily"]
+    if not daily:
+        return {
+            "window": bodycomp["window"],
+            "latest": bodycomp["latest"],
+            "trend": bodycomp["trend"],
+            "changes": {
+                "weight_kg": None,
+                "fat_mass_kg": None,
+                "lean_mass_kg": None,
+            },
+            "verdict": "insufficient data",
+            "summary": "There are no body-composition rows in this window yet, so fat-loss guidance is limited.",
+            "coach_notes": [
+                "Keep logging weigh-ins consistently so the coach can separate fat loss from water noise."
+            ],
+        }
     valid_fat = [item for item in daily if item["fat_mass_kg"] is not None]
     valid_lean = [item for item in daily if item["lean_mass_kg"] is not None]
 
@@ -750,9 +881,101 @@ def format_today_plan_reply(client: FitbitClient, target_date: str) -> str:
     )
 
 
+def format_tomorrow_plan_reply(client: FitbitClient, target_date: str) -> str:
+    coach = build_coach_report(client, target_date)
+    trends = build_trends_report(client, target_date, 7)
+    fatloss = build_fatloss_report(client, target_date, 30)
+    zepbound = build_zepbound_report(client, target_date)
+
+    zone_minutes = coach["stats"]["zone_minutes"]
+    sleep_efficiency = coach["stats"]["sleep_efficiency"] or 0
+    days_since_shot = zepbound["days_since_last_dose"]
+
+    if zone_minutes >= 45 and sleep_efficiency < 78:
+        plan = "Aim for a recovery-biased day tomorrow: walking, mobility, and maybe light strength technique, but not a second hard hit."
+    elif zone_minutes >= 45:
+        plan = "Tomorrow can be a normal training day if you wake up feeling decent, but it does not need to be a hero day."
+    elif coach["readiness"] in {"amber", "trained-but-watch-recovery"}:
+        plan = "Tomorrow should focus on base building: protein, walking, and the simplest useful training option."
+    else:
+        plan = "Tomorrow is a good candidate for strength work or a purposeful aerobic session if recovery feels normal."
+
+    hunger_note = (
+        "You will also be moving farther from your Zepbound shot, so appetite may creep up and planning meals will matter more."
+        if days_since_shot is not None and days_since_shot >= 4
+        else "You are still fairly close to your Zepbound dose, so keep protein first and avoid under-eating after today's training."
+    )
+
+    trend_note = (
+        "Your fat-loss trend still reads as mostly water noise, so tomorrow's win is consistency and lean-mass protection, not slash-and-burn dieting."
+        if fatloss["verdict"] == "mostly water noise"
+        else "Your trend is clearer, so tomorrow is mostly about staying steady rather than getting dramatic."
+    )
+
+    weekly_note = (
+        f"Seven-day consistency is {trends['consistency']['step_goal_consistency']}, with average sleep at {trends['averages']['sleep']}."
+    )
+
+    return f"{plan} {hunger_note} {trend_note} {weekly_note}"
+
+
+def build_llm_context(client: FitbitClient, prompt: str, target_date: str) -> dict[str, Any]:
+    topic = detect_topic(prompt)
+    context: dict[str, Any] = {"date": target_date, "topic_hint": topic}
+
+    try:
+        context["coach"] = build_coach_report(client, target_date)
+    except Exception as exc:  # noqa: BLE001
+        context["coach_error"] = str(exc)
+
+    try:
+        context["zepbound"] = build_zepbound_report(client, target_date)
+    except Exception as exc:  # noqa: BLE001
+        context["zepbound_error"] = str(exc)
+
+    if topic in {"fatloss", "tomorrow_plan", "today_plan", "other"}:
+        try:
+            context["fatloss"] = build_fatloss_report(client, target_date, 30)
+        except Exception as exc:  # noqa: BLE001
+            context["fatloss_error"] = str(exc)
+
+    if topic in {"trends", "tomorrow_plan", "other"}:
+        try:
+            context["trends"] = build_trends_report(client, target_date, 7)
+        except Exception as exc:  # noqa: BLE001
+            context["trends_error"] = str(exc)
+
+    return context
+
+
+def llm_answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
+    context = build_llm_context(client, prompt, target_date)
+    system_prompt = (
+        "You are an elite recovery-first personal trainer and longevity coach for women’s health, "
+        "with special focus on fat loss, sarcopenia prevention over age 60, and GLP-1 support. "
+        "Be supportive, decisive, witty, and data-driven. Use only the provided context. "
+        "If data is missing or rate-limited, say so plainly. Do not invent metrics or medical claims. "
+        "Prefer practical coaching actions over generic advice."
+    )
+    user_prompt = (
+        f"User question: {prompt}\n"
+        f"Reference date: {target_date}\n"
+        "Structured context:\n"
+        f"{json.dumps(context, indent=2)}"
+    )
+    return client.openai_response(system_prompt, user_prompt)
+
+
 def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
+    if client.config.openai_api_key:
+        try:
+            return llm_answer_chat(client, prompt, target_date)
+        except Exception:
+            pass
     text = prompt.strip().lower()
     topic = detect_topic(text)
+    if topic == "tomorrow_plan":
+        return format_tomorrow_plan_reply(client, target_date)
     if topic == "today_plan":
         return format_today_plan_reply(client, target_date)
     if topic == "zepbound":
@@ -765,8 +988,8 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
         return format_coach_reply(build_coach_report(client, target_date))
     if topic == "help":
         return (
-            "Try: 'Can I train today?', 'How is my 7-day trend?', "
-            "'Am I losing fat or lean mass?', or 'Give me the body comp read.'"
+            "Try: 'What should I do today?', 'What should I aim to do tomorrow?', "
+            "'How is my 7-day trend?', 'Am I losing fat or lean mass?', or 'How many days since my shot?'"
         )
     if topic == "empty":
         return "Ask about training readiness, weekly trends, fat loss, body composition, or today."
@@ -779,6 +1002,25 @@ def detect_topic(text: str) -> str:
     text = text.strip().lower()
     if not text:
         return "empty"
+    if any(
+        phrase in text
+        for phrase in [
+            "what should i aim to do tomorrow",
+            "what should i do tomorrow",
+            "plan for tomorrow",
+            "tomorrow plan",
+            "what about tomorrow",
+            "how about tomorrow",
+            "so coach, how about tomorrow",
+            "coach, how about tomorrow",
+            "for tomorrow",
+            "what is tomorrows plan",
+            "what's tomorrows plan",
+            "what is tomorrow's plan",
+            "what's tomorrow's plan",
+        ]
+    ):
+        return "tomorrow_plan"
     if any(phrase in text for phrase in ["what should i do today", "today plan", "plan for today", "what now"]):
         return "today_plan"
     if any(word in text for word in ["zepbound", "shot", "dose", "dosing", "glp", "medication"]):

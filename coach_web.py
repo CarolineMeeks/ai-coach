@@ -11,16 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from fitbit_client import (
-    FitbitClient,
-    FitbitConfig,
-    answer_chat,
-    build_coach_report,
-    build_fatloss_report,
-    build_trends_report,
-    build_zepbound_report,
-    detect_topic,
-)
+from fitbit_client import FitbitClient, FitbitConfig, answer_chat, build_coach_report, build_fatloss_report, build_trends_report, build_zepbound_report, detect_topic
 from interaction_log import append_interaction, read_recent_interactions
 
 
@@ -28,16 +19,51 @@ STATIC_DIR = Path(__file__).with_name("web")
 
 
 def load_status_payload(client: FitbitClient, target_date: str) -> dict:
+    client.reset_cache_events()
     coach = build_coach_report(client, target_date)
     trends = build_trends_report(client, target_date, 7)
     fatloss = build_fatloss_report(client, target_date, 30)
     zepbound = build_zepbound_report(client, target_date)
+    cache_events = client.consume_cache_events()
+    used_stale = any(event["kind"] == "stale" for event in cache_events)
+    used_cache = any(event["kind"] == "cache" for event in cache_events)
     return {
         "date": target_date,
         "coach": coach,
         "trends": trends,
         "fatloss": fatloss,
         "zepbound": zepbound,
+        "cache_status": {
+            "used_cache": used_cache,
+            "used_stale": used_stale,
+            "message": (
+                "Using cached Fitbit data because the API is temporarily rate-limited."
+                if used_stale
+                else "Using recently cached Fitbit data to keep the app fast and rate-limit friendly."
+                if used_cache
+                else "Using fresh Fitbit data."
+            ),
+        },
+    }
+
+
+def with_cache_status(client: FitbitClient, payload: dict) -> dict:
+    cache_events = client.consume_cache_events()
+    used_stale = any(event["kind"] == "stale" for event in cache_events)
+    used_cache = any(event["kind"] == "cache" for event in cache_events)
+    return {
+        **payload,
+        "cache_status": {
+            "used_cache": used_cache,
+            "used_stale": used_stale,
+            "message": (
+                "Using cached Fitbit data because the API is temporarily rate-limited."
+                if used_stale
+                else "Using recently cached Fitbit data to keep the app fast and rate-limit friendly."
+                if used_cache
+                else "Using fresh Fitbit data."
+            ),
+        },
     }
 
 
@@ -77,6 +103,66 @@ def make_handler(client: FitbitClient):
             if route == "/api/status":
                 try:
                     payload = load_status_payload(client, target_date)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                self._send_json(payload)
+                return
+            if route == "/api/today":
+                try:
+                    client.reset_cache_events()
+                    payload = with_cache_status(
+                        client,
+                        {
+                            "date": target_date,
+                            "coach": build_coach_report(client, target_date),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                self._send_json(payload)
+                return
+            if route == "/api/trends":
+                try:
+                    client.reset_cache_events()
+                    payload = with_cache_status(
+                        client,
+                        {
+                            "date": target_date,
+                            "trends": build_trends_report(client, target_date, 7),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                self._send_json(payload)
+                return
+            if route == "/api/fatloss":
+                try:
+                    client.reset_cache_events()
+                    payload = with_cache_status(
+                        client,
+                        {
+                            "date": target_date,
+                            "fatloss": build_fatloss_report(client, target_date, 30),
+                        },
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                self._send_json(payload)
+                return
+            if route == "/api/zepbound":
+                try:
+                    client.reset_cache_events()
+                    payload = with_cache_status(
+                        client,
+                        {
+                            "date": target_date,
+                            "zepbound": build_zepbound_report(client, target_date),
+                        },
+                    )
                 except Exception as exc:  # noqa: BLE001
                     self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                     return

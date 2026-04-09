@@ -91,6 +91,12 @@ The browser UI shows:
 - a plain-English chat interface backed by the same coaching logic as the CLI
 - a recent interaction history panel loaded from `coach_interactions.jsonl`
 
+The app also uses short-lived in-memory caching to avoid hammering Fitbit:
+
+- OAuth access tokens are reused until near expiry instead of refreshing every request
+- Fitbit API responses are cached for about 5 minutes
+- the public Zepbound sheet is cached for about 15 minutes
+
 ## Interaction history
 
 Every terminal or browser chat exchange is appended to a local JSONL log file:
@@ -109,3 +115,15 @@ Each record includes:
 - date context
 - your message
 - the coach reply
+
+## Optional OpenAI conversation layer
+
+If you set `OPENAI_API_KEY`, the coach can use an OpenAI model to make conversations more flexible while still grounding answers in your Fitbit, body-composition, and Zepbound data.
+
+Recommended env vars:
+
+- `OPENAI_API_KEY`
+- `OPENAI_MODEL=gpt-5.4-mini`
+- `OPENAI_BASE_URL=https://api.openai.com/v1`
+
+The app keeps the current deterministic data layer and uses the LLM only as the conversation layer. If the OpenAI call fails, chat falls back to the built-in rule-based replies.
