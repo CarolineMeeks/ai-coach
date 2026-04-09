@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import traceback
 import secrets
-from datetime import date
+import threading
+import time
+import traceback
+from datetime import date, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -19,6 +21,7 @@ from fitbit_client import (
     answer_chat,
     build_coach_report,
     build_fatloss_report,
+    run_due_scheduler_cycle,
     build_trends_report,
     build_water_report,
     build_water_sms_prompt,
@@ -365,6 +368,20 @@ def make_handler(client: FitbitClient):
     return CoachHandler
 
 
+def scheduler_loop(client: FitbitClient, stop_event: threading.Event) -> None:
+    poll_seconds = max(15, client.config.scheduler_poll_seconds)
+    print(f"Scheduler loop enabled. Polling every {poll_seconds} seconds.", flush=True)
+    while not stop_event.is_set():
+        try:
+            result = run_due_scheduler_cycle(client, now=datetime.now().astimezone(), send=True)
+            if result.get("status") not in {"idle", "already_ran"}:
+                print(f"SCHEDULER {json.dumps(result)}", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"SCHEDULER ERROR: {exc}", flush=True)
+            print(traceback.format_exc(), flush=True)
+        stop_event.wait(poll_seconds)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Local web UI for the Fitbit coach")
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind")
@@ -376,8 +393,18 @@ def main() -> None:
     args = parse_args()
     client = FitbitClient(FitbitConfig.from_env())
     server = ThreadingHTTPServer((args.host, args.port), make_handler(client))
+    scheduler_stop = threading.Event()
+    scheduler_thread: threading.Thread | None = None
+    if client.config.scheduler_enabled:
+        scheduler_thread = threading.Thread(target=scheduler_loop, args=(client, scheduler_stop), daemon=True)
+        scheduler_thread.start()
     print(f"Coach web app running at http://{args.host}:{args.port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        scheduler_stop.set()
+        if scheduler_thread is not None:
+            scheduler_thread.join(timeout=1)
 
 
 if __name__ == "__main__":

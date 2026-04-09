@@ -88,6 +88,18 @@ class CoachDB:
                     created_at TEXT NOT NULL,
                     FOREIGN KEY(user_id) REFERENCES users(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS reminder_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    reminder_key TEXT NOT NULL,
+                    run_date TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id),
+                    UNIQUE(user_id, reminder_key, run_date)
+                );
                 """
             )
             self._ensure_column(connection, "user_goals", "water_goal_min_oz", "INTEGER NOT NULL DEFAULT 80")
@@ -262,6 +274,47 @@ class CoachDB:
                 (user_id, log_date),
             ).fetchone()
         return round(float(row["total_oz"]) if row and row["total_oz"] is not None else 0.0, 1)
+
+    def reminder_already_run(self, user_id: int, reminder_key: str, run_date: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM reminder_runs
+                WHERE user_id = ? AND reminder_key = ? AND run_date = ?
+                """,
+                (user_id, reminder_key, run_date),
+            ).fetchone()
+        return row is not None
+
+    def record_reminder_run(
+        self,
+        user_id: int,
+        reminder_key: str,
+        run_date: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO reminder_runs (user_id, reminder_key, run_date, status, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, reminder_key, run_date) DO UPDATE SET
+                    status = excluded.status,
+                    payload_json = excluded.payload_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    user_id,
+                    reminder_key,
+                    run_date,
+                    status,
+                    json.dumps(payload, sort_keys=True) if payload is not None else None,
+                    created_at,
+                ),
+            )
 
     def migrate_legacy_token_file(self, user_id: int, token_path: Path) -> bool:
         if self.get_fitbit_tokens(user_id) is not None or not token_path.exists():

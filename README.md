@@ -191,12 +191,37 @@ Useful commands:
   - `python3 fitbit_client.py water-reminder --date 2026-04-08 --window evening`
 - send one through Twilio:
   - `python3 fitbit_client.py water-reminder --date 2026-04-08 --window noon --send`
+- dry-run a scheduler check:
+  - `python3 fitbit_client.py run-scheduler --at 2026-04-09T12:00:00-04:00`
+- send a due reminder through the scheduler:
+  - `python3 fitbit_client.py run-scheduler --at 2026-04-09T12:00:00-04:00 --send`
 
 For inbound SMS, the web app exposes:
 
 - `POST /sms/webhook`
 
 That webhook currently parses water replies like `24 oz`, logs the intake, and returns a short confirmation message.
+
+## Reminder scheduler
+
+The web app can optionally run a small background scheduler for hydration reminders.
+
+Recommended env vars:
+
+- `COACH_ENABLE_SCHEDULER=1`
+- `COACH_SCHEDULER_POLL_SECONDS=60`
+
+Behavior:
+
+- checks for a noon hydration reminder
+- checks for a 9:45 PM hydration reminder
+- records reminder runs in SQLite so the same reminder is not sent twice on the same day
+- skips the 9:45 PM hydration text if the water goal is already met
+
+Important:
+
+- enable the scheduler in only one running instance, or you risk duplicate texts
+- for local testing, leave it off and use `run-scheduler`
 
 ## Optional OpenAI conversation layer
 

@@ -60,6 +60,8 @@ class FitbitConfig:
     twilio_auth_token: str | None = None
     twilio_from_number: str | None = None
     sms_to_number: str | None = None
+    scheduler_enabled: bool = False
+    scheduler_poll_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> "FitbitConfig":
@@ -80,6 +82,8 @@ class FitbitConfig:
         twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip() or None
         twilio_from_number = os.getenv("TWILIO_FROM_NUMBER", "").strip() or None
         sms_to_number = os.getenv("SMS_TO_NUMBER", "").strip() or None
+        scheduler_enabled = os.getenv("COACH_ENABLE_SCHEDULER", "").strip().lower() in {"1", "true", "yes", "on"}
+        scheduler_poll_seconds = int(os.getenv("COACH_SCHEDULER_POLL_SECONDS", "60").strip() or "60")
 
         missing = [
             name
@@ -108,6 +112,8 @@ class FitbitConfig:
             twilio_auth_token=twilio_auth_token,
             twilio_from_number=twilio_from_number,
             sms_to_number=sms_to_number,
+            scheduler_enabled=scheduler_enabled,
+            scheduler_poll_seconds=scheduler_poll_seconds,
         )
 
 
@@ -364,6 +370,18 @@ class FitbitClient:
         )
         response.raise_for_status()
         return response.json()
+
+    def reminder_already_run(self, reminder_key: str, run_date: str) -> bool:
+        return self.db.reminder_already_run(self.user.id, reminder_key, run_date)
+
+    def record_reminder_run(
+        self,
+        reminder_key: str,
+        run_date: str,
+        status: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.db.record_reminder_run(self.user.id, reminder_key, run_date, status, payload)
 
 
 def get_day_snapshot(client: FitbitClient, target_date: str) -> dict[str, Any]:
@@ -695,6 +713,69 @@ def build_water_sms_prompt(client: FitbitClient, target_date: str, window: str, 
             "reason": "goal_still_open",
         }
     raise ValueError(f"Unsupported water reminder window: {window}")
+
+
+def due_water_reminder_window(now: datetime) -> str | None:
+    minute_of_day = now.hour * 60 + now.minute
+    if 12 * 60 <= minute_of_day < 12 * 60 + 5:
+        return "noon"
+    if 21 * 60 + 45 <= minute_of_day < 21 * 60 + 50:
+        return "evening"
+    return None
+
+
+def run_due_scheduler_cycle(
+    client: FitbitClient,
+    now: datetime | None = None,
+    send: bool = True,
+    warm_day: bool = False,
+) -> dict[str, Any]:
+    current = now or datetime.now().astimezone()
+    target_date = current.date().isoformat()
+    window = due_water_reminder_window(current)
+    if window is None:
+        return {
+            "date": target_date,
+            "timestamp": current.isoformat(),
+            "status": "idle",
+            "reason": "outside reminder windows",
+        }
+
+    reminder_key = f"water_{window}"
+    if client.reminder_already_run(reminder_key, target_date):
+        return {
+            "date": target_date,
+            "timestamp": current.isoformat(),
+            "status": "already_ran",
+            "window": window,
+        }
+
+    reminder = build_water_sms_prompt(client, target_date, window=window, warm_day=warm_day)
+    payload: dict[str, Any] = {
+        "date": target_date,
+        "timestamp": current.isoformat(),
+        "window": window,
+        "status": "skipped" if not reminder["send"] else "pending_send",
+        "reason": reminder["reason"],
+        "message": reminder["message"],
+        "sent": False,
+    }
+
+    if not reminder["send"]:
+        client.record_reminder_run(reminder_key, target_date, "skipped", payload)
+        return payload
+
+    if send and reminder["message"]:
+        sms_payload = client.send_sms(reminder["message"])
+        payload["status"] = "sent"
+        payload["sent"] = True
+        payload["sid"] = sms_payload.get("sid")
+        client.record_reminder_run(reminder_key, target_date, "sent", payload)
+        return payload
+
+    payload["status"] = "dry_run"
+    client.record_reminder_run(reminder_key, target_date, "dry_run", payload)
+    return payload
 
 
 def handle_water_sms_reply(client: FitbitClient, body: str, target_date: str) -> str:
@@ -1686,6 +1767,11 @@ def run_water_reply(client: FitbitClient, target_date: str, body: str) -> None:
     print(json.dumps({"reply": reply, "report": build_water_report(client, target_date)}, indent=2))
 
 
+def run_scheduler(client: FitbitClient, send: bool, at_iso: str | None) -> None:
+    now = datetime.fromisoformat(at_iso) if at_iso else datetime.now().astimezone()
+    print(json.dumps(run_due_scheduler_cycle(client, now=now, send=send), indent=2))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fitbit CLI for recovery-first coaching workflows")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1743,6 +1829,10 @@ def parse_args() -> argparse.Namespace:
     water_reply_parser.add_argument("body", help="Incoming message body, for example '24 oz'")
     water_reply_parser.add_argument("--date", default=str(date.today()), help="Reference date in YYYY-MM-DD format")
 
+    scheduler_parser = subparsers.add_parser("run-scheduler", help="Run one scheduler cycle for due reminders")
+    scheduler_parser.add_argument("--send", action="store_true", help="Actually send due reminders instead of dry-run logging")
+    scheduler_parser.add_argument("--at", default=None, help="Optional ISO datetime for testing, for example 2026-04-09T12:00:00-04:00")
+
     return parser.parse_args()
 
 
@@ -1779,6 +1869,8 @@ def main() -> None:
         run_water_reminder(client, args.date, args.window, args.warm_day, args.send)
     elif args.command == "water-reply":
         run_water_reply(client, args.date, args.body)
+    elif args.command == "run-scheduler":
+        run_scheduler(client, args.send, args.at)
     else:
         raise ValueError(f"Unknown command {args.command}")
 
