@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 from datetime import date
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -16,6 +17,7 @@ from interaction_log import append_interaction, read_recent_interactions
 
 
 STATIC_DIR = Path(__file__).with_name("web")
+OAUTH_STATES: set[str] = set()
 
 
 def load_status_payload(client: FitbitClient, target_date: str) -> dict:
@@ -93,6 +95,45 @@ def make_handler(client: FitbitClient):
 
             if route == "/":
                 self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+                return
+            if route == "/connect-fitbit":
+                state = secrets.token_urlsafe(24)
+                OAUTH_STATES.add(state)
+                auth_url = client.build_auth_url(state)
+                self.send_response(HTTPStatus.FOUND)
+                self.send_header("Location", auth_url)
+                self.end_headers()
+                return
+            if route == "/callback":
+                code = query.get("code", [""])[0]
+                state = query.get("state", [""])[0]
+                if not code or state not in OAUTH_STATES:
+                    self.send_error(HTTPStatus.BAD_REQUEST, "Invalid or missing OAuth state/code.")
+                    return
+                OAUTH_STATES.discard(state)
+                try:
+                    payload = client.exchange_code(code)
+                    user_id = payload.get("user_id", "unknown")
+                    body = (
+                        "<!doctype html><html><head><meta charset='utf-8'>"
+                        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                        "<title>Fitbit Connected</title>"
+                        "<style>body{font-family:Georgia,serif;background:#f3eadf;color:#1f2933;"
+                        "display:grid;place-items:center;min-height:100vh;margin:0;padding:24px}"
+                        "main{max-width:620px;background:#fffaf3;border:1px solid #e7d7bf;"
+                        "border-radius:24px;padding:32px;box-shadow:0 18px 40px rgba(31,41,51,.08)}"
+                        "a{color:#0f766e}</style></head><body><main>"
+                        f"<h1>Fitbit connected</h1><p>Tokens saved for Fitbit user {user_id}.</p>"
+                        "<p>You can close this tab and go back to the coach app.</p>"
+                        "<p><a href='/'>Return to coach</a></p></main></body></html>"
+                    ).encode("utf-8")
+                    self.send_response(HTTPStatus.OK)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except Exception as exc:  # noqa: BLE001
+                    self._send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
                 return
             if route == "/app.js":
                 self._send_file(STATIC_DIR / "app.js", "application/javascript; charset=utf-8")

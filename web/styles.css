@@ -204,6 +204,16 @@ h1 {
   line-height: 1.65;
 }
 
+.connect-link {
+  display: inline-block;
+  padding: 10px 16px;
+  border-radius: 999px;
+  background: var(--accent-2);
+  color: white;
+  text-decoration: none;
+  border: 1px solid rgba(15, 118, 110, 0.2);
+}
+
 .panel-head {
   display: flex;
   justify-content: space-between;

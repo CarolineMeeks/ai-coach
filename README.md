@@ -97,6 +97,18 @@ The app also uses short-lived in-memory caching to avoid hammering Fitbit:
 - Fitbit API responses are cached for about 5 minutes
 - the public Zepbound sheet is cached for about 15 minutes
 
+## Hosted Fitbit OAuth
+
+For a deployed app, set:
+
+- `FITBIT_REDIRECT_URI=https://your-app.onrender.com/callback`
+
+Then visit:
+
+- `https://your-app.onrender.com/connect-fitbit`
+
+That route starts Fitbit OAuth and saves tokens when Fitbit redirects back to `/callback`.
+
 ## Interaction history
 
 Every terminal or browser chat exchange is appended to a local JSONL log file:
