@@ -17,7 +17,7 @@ import urllib.parse
 import webbrowser
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,11 @@ import requests
 
 from app_db import DEFAULT_DB_PATH, CoachDB, CoachUser
 
+
+APP_TIMEZONE = "America/New_York"
+if hasattr(time, "tzset"):
+    os.environ["TZ"] = os.getenv("COACH_TIMEZONE", APP_TIMEZONE)
+    time.tzset()
 
 AUTH_URL = "https://www.fitbit.com/oauth2/authorize"
 TOKEN_URL = "https://api.fitbit.com/oauth2/token"
@@ -383,6 +388,26 @@ class FitbitClient:
     ) -> None:
         self.db.record_reminder_run(self.user.id, reminder_key, run_date, status, payload)
 
+    def add_workout_log(
+        self,
+        workout_date: str,
+        workout_name: str,
+        workout_category: str | None = None,
+        source: str = "manual",
+        note: str | None = None,
+    ) -> None:
+        self.db.add_workout_log(
+            self.user.id,
+            workout_date,
+            workout_name,
+            workout_category=workout_category,
+            source=source,
+            note=note,
+        )
+
+    def get_recent_workouts(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self.db.get_recent_workouts(self.user.id, limit=limit)
+
 
 def get_day_snapshot(client: FitbitClient, target_date: str) -> dict[str, Any]:
     activity = client.get_json(f"/1/user/-/activities/date/{target_date}.json")
@@ -492,6 +517,51 @@ def parse_sheet_date(value: str) -> date:
     return datetime.strptime(value.strip(), "%a, %b %d, %Y").date()
 
 
+def get_profile_time_context(client: FitbitClient) -> dict[str, Any]:
+    profile = client.get_json("/1/user/-/profile.json")
+    user = profile.get("user", {})
+    timezone_name = user.get("timezone") or os.getenv("COACH_TIMEZONE", APP_TIMEZONE)
+
+    offset_millis = (
+        user.get("offsetFromUTCMillis")
+        or user.get("offsetFromUTCMillis")
+        or user.get("offsetFromUtcMillis")
+    )
+    if offset_millis is None and user.get("offsetFromUTC") is not None:
+        try:
+            offset_millis = int(float(user.get("offsetFromUTC")) * 3600000)
+        except (TypeError, ValueError):
+            offset_millis = None
+
+    offset_minutes = 0
+    if offset_millis is not None:
+        try:
+            offset_minutes = int(int(offset_millis) / 60000)
+        except (TypeError, ValueError):
+            offset_minutes = 0
+
+    return {
+        "timezone": timezone_name,
+        "offset_minutes": offset_minutes,
+    }
+
+
+def current_date_for_client(client: FitbitClient, now: datetime | None = None) -> str:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
+
+    try:
+        time_context = get_profile_time_context(client)
+    except Exception:  # noqa: BLE001
+        return date.today().isoformat()
+
+    offset = timedelta(minutes=int(time_context.get("offset_minutes", 0) or 0))
+    return (current + offset).date().isoformat()
+
+
 def build_google_csv_url(sheet_url: str) -> str:
     if "/export?" in sheet_url and "format=csv" in sheet_url:
         return sheet_url
@@ -513,6 +583,68 @@ def parse_water_oz(text: str) -> float | None:
     if text.strip().isdigit():
         return round(float(text.strip()), 1)
     return None
+
+
+def parse_relative_date(text: str, target_date: str) -> str:
+    base = datetime.strptime(target_date, "%Y-%m-%d").date()
+    lowered = text.lower()
+    if "yesterday" in lowered:
+        return (base - timedelta(days=1)).isoformat()
+    if "tomorrow" in lowered:
+        return (base + timedelta(days=1)).isoformat()
+    return target_date
+
+
+def categorize_workout(name: str) -> str:
+    lowered = name.lower()
+    if "strength" in lowered or "lift" in lowered or "weights" in lowered:
+        return "strength"
+    if "dance" in lowered:
+        return "dance"
+    if "bike" in lowered or "cycling" in lowered:
+        return "bike"
+    if "hike" in lowered or "walk" in lowered:
+        return "walk"
+    if "sail" in lowered:
+        return "sailing"
+    return "other"
+
+
+def parse_workout_log(text: str, target_date: str) -> dict[str, str] | None:
+    lowered = text.lower()
+    if "i did" not in lowered and "i took" not in lowered and "i went to" not in lowered:
+        return None
+    if "workout" not in lowered and "class" not in lowered and "strength" not in lowered and "dance" not in lowered:
+        return None
+
+    workout_date = parse_relative_date(text, target_date)
+    phrase = text.strip()
+    for prefix in ["I did ", "i did ", "I took ", "i took ", "I went to ", "i went to "]:
+        if phrase.startswith(prefix):
+            phrase = phrase[len(prefix):]
+            break
+    for suffix in [" yesterday", " today", " this morning", " this evening", " tonight"]:
+        if phrase.lower().endswith(suffix):
+            phrase = phrase[: -len(suffix)]
+            break
+    workout_name = phrase.strip(" .")
+    if not workout_name:
+        return None
+    return {
+        "workout_date": workout_date,
+        "workout_name": workout_name,
+        "workout_category": categorize_workout(workout_name),
+    }
+
+
+def detect_symptom_flags(text: str) -> dict[str, bool]:
+    lowered = text.lower()
+    return {
+        "very_sore": "very sore" in lowered or "really sore" in lowered or "extremely sore" in lowered,
+        "stairs_pain": "painful to walk up stairs" in lowered or "stairs" in lowered and "pain" in lowered,
+        "tired": "tired" in lowered or "exhausted" in lowered or "fatigued" in lowered,
+        "missed_activity": "didn't go" in lowered or "did not go" in lowered or "skipped" in lowered,
+    }
 
 
 def interpret_water_entry(text: str, current_total_oz: float) -> dict[str, Any] | None:
@@ -1198,7 +1330,7 @@ def build_zepbound_report(client: FitbitClient, target_date: str) -> dict[str, A
         coach_notes.append("Your dosing data is available, so we can line up appetite, recovery, and training around the shot cycle.")
 
     shot_logged_today = bool(last_dose and last_dose["date"] == target_date)
-    shot_status = "met" if shot_logged_today else "pending" if target_date == date.today().isoformat() else "not_met"
+    shot_status = "met" if shot_logged_today else "pending" if target_date == current_date_for_client(client) else "not_met"
     shot_summary = (
         "Shot logged today"
         if shot_status == "met"
@@ -1408,6 +1540,55 @@ def format_goal_check_reply(client: FitbitClient, target_date: str) -> str:
     )
 
 
+def format_workout_log_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
+    parsed = parse_workout_log(prompt, target_date)
+    if parsed is None:
+        return "I could not cleanly tell what workout to log yet."
+    client.add_workout_log(
+        parsed["workout_date"],
+        parsed["workout_name"],
+        workout_category=parsed["workout_category"],
+        source="chat",
+        note=prompt.strip(),
+    )
+    recent = client.get_recent_workouts(limit=1)[0]
+    return (
+        f"Logged it. I have {recent['workout_name']} on {recent['workout_date']} as a "
+        f"{recent.get('workout_category') or 'workout'} session. That will help the coach notice patterns like "
+        f"whether this kind of session stops wrecking you over time."
+    )
+
+
+def format_symptom_override_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
+    flags = detect_symptom_flags(prompt)
+    recent_workouts = client.get_recent_workouts(limit=3)
+    latest_workout = recent_workouts[0] if recent_workouts else None
+    workout_line = (
+        f" The most recent logged workout was {latest_workout['workout_name']} on {latest_workout['workout_date']}."
+        if latest_workout
+        else ""
+    )
+    if flags["very_sore"] or flags["stairs_pain"]:
+        return (
+            "This is a recovery day, not a character-building contest. "
+            "If stairs are painful and you are very sore, the coach should not be nudging brisk walking or strength technique tonight. "
+            "The goal now is food, hydration, sleep, and only gentle movement if it actually makes you feel better."
+            f"{workout_line}"
+        )
+    if flags["tired"] and flags["missed_activity"]:
+        return (
+            "You already have enough evidence that recovery gets veto power today. "
+            "Missing the dance because you were wiped out is not a motivation problem; it is feedback. "
+            "Tonight should be about recovery, not trying to earn your way back into the green."
+            f"{workout_line}"
+        )
+    return (
+        "Your symptoms matter more than the app trying to sound brave. "
+        "If soreness and fatigue are high, the plan should downgrade toward recovery even if your Fitbit numbers look respectable."
+        f"{workout_line}"
+    )
+
+
 def format_today_plan_reply(client: FitbitClient, target_date: str) -> str:
     coach = build_coach_report(client, target_date)
     fatloss = build_fatloss_report(client, target_date, 30)
@@ -1541,6 +1722,13 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
         return format_activity_observation_reply(client, target_date)
     if topic == "goal_check":
         return format_goal_check_reply(client, target_date)
+    if topic == "workout_log":
+        return format_workout_log_reply(client, prompt, target_date)
+    if topic == "symptom_override":
+        workout_reply = ""
+        if parse_workout_log(prompt, target_date) is not None:
+            workout_reply = format_workout_log_reply(client, prompt, target_date) + " "
+        return workout_reply + format_symptom_override_reply(client, prompt, target_date)
     if topic == "water":
         amount_oz = parse_water_oz(text)
         if amount_oz is not None:
@@ -1592,6 +1780,12 @@ def detect_topic(text: str) -> str:
         ]
     ):
         return "goal_check"
+    if any(word in text for word in ["sore", "stairs", "painful", "exhausted", "fatigued"]) and any(
+        word in text for word in ["i did", "i took", "workout", "class", "dance", "tired", "didn't go", "did not go", "skipped"]
+    ):
+        return "symptom_override"
+    if parse_workout_log(text, date.today().isoformat()) is not None:
+        return "workout_log"
     if any(
         phrase in text
         for phrase in [

@@ -110,6 +110,7 @@ Default database path:
 
 Recommended env vars:
 
+- `COACH_TIMEZONE=America/New_York`
 - `COACH_DB_PATH=coach.db`
 - `COACH_USER_SLUG=default`
 
@@ -125,6 +126,8 @@ The app also uses short-lived in-memory caching to avoid hammering Fitbit:
 - OAuth access tokens are reused until near expiry instead of refreshing every request
 - Fitbit API responses are cached for about 5 minutes
 - the public Zepbound sheet is cached for about 15 minutes
+
+The app defaults to `America/New_York` for "today" unless you override `COACH_TIMEZONE`.
 
 ## Hosted Fitbit OAuth
 

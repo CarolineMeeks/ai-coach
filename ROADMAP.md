@@ -20,6 +20,8 @@ This file is the parking lot for work we are not doing right now, but do not wan
 - Protein target guidance that shows up in the daily summary
 - Better celebration language when goals are met
 - Proactive outreach for high-value moments like morning plans, goal wins, and evening reminders
+- Workout history tracking so the coach can learn exercise patterns and compare soreness over time
+- Symptom-aware overrides when soreness, fatigue, or pain should veto the cheerful Fitbit-only answer
 
 ## Manual Tracking
 

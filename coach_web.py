@@ -26,6 +26,7 @@ from fitbit_client import (
     build_water_report,
     build_water_sms_prompt,
     build_zepbound_report,
+    current_date_for_client,
     detect_topic,
     handle_water_sms_reply,
 )
@@ -33,6 +34,12 @@ from fitbit_client import (
 
 STATIC_DIR = Path(__file__).with_name("web")
 OAUTH_STATES: set[str] = set()
+
+
+def resolve_target_date(client: FitbitClient, values: list[str] | None) -> str:
+    if values and values[0]:
+        return values[0]
+    return current_date_for_client(client)
 
 
 def load_status_payload(client: FitbitClient, target_date: str) -> dict:
@@ -109,7 +116,7 @@ def make_handler(client: FitbitClient):
             parsed = urlparse(self.path)
             route = parsed.path
             query = parse_qs(parsed.query)
-            target_date = query.get("date", [str(date.today())])[0]
+            target_date = resolve_target_date(client, query.get("date"))
             self._log(f"GET {route} date={target_date}")
 
             if route == "/":
@@ -285,7 +292,7 @@ def make_handler(client: FitbitClient):
                 raw = self.rfile.read(content_length).decode("utf-8")
                 form = parse_qs(raw)
                 body = str(form.get("Body", [""])[0])
-                target_date = str(form.get("Date", [date.today().isoformat()])[0])
+                target_date = resolve_target_date(client, form.get("Date"))
                 reply = handle_water_sms_reply(client, body, target_date)
                 client.append_interaction(
                     {
@@ -319,7 +326,7 @@ def make_handler(client: FitbitClient):
                     self._send_json({"error": "amount_oz is required and must be numeric."}, HTTPStatus.BAD_REQUEST)
                     return
 
-                target_date = str(payload.get("date", date.today()))
+                target_date = str(payload.get("date") or current_date_for_client(client))
                 note = str(payload.get("note", "")).strip() or None
                 source = str(payload.get("source", "web-water"))
                 client.add_water_intake(target_date, amount_oz, source=source, note=note)
@@ -339,7 +346,7 @@ def make_handler(client: FitbitClient):
                 return
 
             prompt = str(payload.get("message", ""))
-            target_date = str(payload.get("date", date.today()))
+            target_date = str(payload.get("date") or current_date_for_client(client))
             if not prompt.strip():
                 self._send_json({"error": "Message is required."}, HTTPStatus.BAD_REQUEST)
                 return

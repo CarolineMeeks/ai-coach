@@ -1,5 +1,5 @@
 const state = {
-  date: new Date().toISOString().slice(0, 10),
+  date: "",
   coach: null,
   trends: null,
   fatloss: null,
@@ -18,8 +18,7 @@ const chatForm = document.querySelector("#chat-form");
 const chatInput = document.querySelector("#chat-input");
 const chatSubmit = document.querySelector("#chat-submit");
 const template = document.querySelector("#message-template");
-
-dateInput.value = state.date;
+const reconnectUrl = "/connect-fitbit";
 
 function addMessage(speaker, content) {
   const fragment = template.content.cloneNode(true);
@@ -142,9 +141,24 @@ async function fetchJson(path) {
 
 async function loadToday() {
   setPanelLoading(summaryCard, true);
-  const payload = await fetchJson(`/api/today?date=${state.date}`);
-  state.coach = payload.coach;
-  setSummary(payload);
+  try {
+    const path = state.date ? `/api/today?date=${state.date}` : "/api/today";
+    const payload = await fetchJson(path);
+    state.coach = payload.coach;
+    state.date = payload.date;
+    dateInput.value = state.date;
+    setSummary(payload);
+  } catch (error) {
+    setPanelLoading(summaryCard, false);
+    summaryCard.innerHTML = `
+      <p class="label">Today</p>
+      <h2>Reconnect Fitbit</h2>
+      <p>${error.message || "Fitbit data did not load."}</p>
+      <p class="meta">If the hosted app lost its tokens, reconnecting is the fix.</p>
+      <p><a class="reconnect-link" href="${reconnectUrl}">Reconnect Fitbit</a></p>
+    `;
+    throw error;
+  }
 }
 
 async function loadSecondary() {
@@ -173,6 +187,7 @@ async function loadSecondary() {
 }
 
 async function loadStatus() {
+  dateInput.value = state.date;
   state.coach = null;
   state.trends = null;
   state.fatloss = null;
@@ -253,6 +268,14 @@ chatForm.addEventListener("submit", async (event) => {
   }
   chatInput.value = "";
   await askCoach(message);
+});
+
+chatInput.addEventListener("keydown", async (event) => {
+  if (event.key !== "Enter" || event.shiftKey) {
+    return;
+  }
+  event.preventDefault();
+  chatForm.requestSubmit();
 });
 
 addMessage("Coach", "Ask me what to do today, whether you should train, how water is going, how fat loss is going, or where you are in the shot cycle.");

@@ -100,6 +100,18 @@ class CoachDB:
                     FOREIGN KEY(user_id) REFERENCES users(id),
                     UNIQUE(user_id, reminder_key, run_date)
                 );
+
+                CREATE TABLE IF NOT EXISTS workout_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    workout_date TEXT NOT NULL,
+                    workout_name TEXT NOT NULL,
+                    workout_category TEXT,
+                    source TEXT,
+                    note TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id)
+                );
                 """
             )
             self._ensure_column(connection, "user_goals", "water_goal_min_oz", "INTEGER NOT NULL DEFAULT 80")
@@ -315,6 +327,40 @@ class CoachDB:
                     created_at,
                 ),
             )
+
+    def add_workout_log(
+        self,
+        user_id: int,
+        workout_date: str,
+        workout_name: str,
+        workout_category: str | None = None,
+        source: str = "manual",
+        note: str | None = None,
+    ) -> None:
+        created_at = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO workout_logs (
+                    user_id, workout_date, workout_name, workout_category, source, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, workout_date, workout_name, workout_category, source, note, created_at),
+            )
+
+    def get_recent_workouts(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT workout_date, workout_name, workout_category, source, note, created_at
+                FROM workout_logs
+                WHERE user_id = ?
+                ORDER BY workout_date DESC, id DESC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def migrate_legacy_token_file(self, user_id: int, token_path: Path) -> bool:
         if self.get_fitbit_tokens(user_id) is not None or not token_path.exists():
