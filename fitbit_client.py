@@ -577,11 +577,16 @@ def build_google_csv_url(sheet_url: str) -> str:
 
 
 def parse_water_oz(text: str) -> float | None:
-    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:oz|ounces?)\b", text.lower())
+    lowered = text.lower().strip()
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:oz|ounces?)\b", lowered)
     if match:
         return round(float(match.group(1)), 1)
-    if text.strip().isdigit():
-        return round(float(text.strip()), 1)
+    if re.search(r"\b(?:water|hydration)\s+(?:at|is)\s+(\d+(?:\.\d+)?)\b", lowered):
+        return round(float(re.search(r"\b(?:water|hydration)\s+(?:at|is)\s+(\d+(?:\.\d+)?)\b", lowered).group(1)), 1)
+    if re.search(r"\bat\s+(\d+(?:\.\d+)?)\b", lowered) and ("water" in lowered or "hydration" in lowered):
+        return round(float(re.search(r"\bat\s+(\d+(?:\.\d+)?)\b", lowered).group(1)), 1)
+    if lowered.isdigit():
+        return round(float(lowered), 1)
     return None
 
 
@@ -618,16 +623,13 @@ def parse_workout_log(text: str, target_date: str) -> dict[str, str] | None:
         return None
 
     workout_date = parse_relative_date(text, target_date)
-    phrase = text.strip()
+    phrase = text.strip().split(".")[0].strip()
     for prefix in ["I did ", "i did ", "I took ", "i took ", "I went to ", "i went to "]:
         if phrase.startswith(prefix):
             phrase = phrase[len(prefix):]
             break
-    for suffix in [" yesterday", " today", " this morning", " this evening", " tonight"]:
-        if phrase.lower().endswith(suffix):
-            phrase = phrase[: -len(suffix)]
-            break
-    workout_name = phrase.strip(" .")
+    phrase = re.sub(r"\b(yesterday|today|this morning|this evening|tonight)\b", "", phrase, flags=re.IGNORECASE)
+    workout_name = re.sub(r"\s+", " ", phrase).strip(" .,-")
     if not workout_name:
         return None
     return {
@@ -1316,6 +1318,12 @@ def build_zepbound_report(client: FitbitClient, target_date: str) -> dict[str, A
             datetime.strptime(last_dose["date"], "%Y-%m-%d").date()
             - datetime.strptime(previous_dose["date"], "%Y-%m-%d").date()
         ).days
+    cadence_days = days_between_last_two or 7
+    next_due_date = None
+    if last_dose:
+        next_due_date = (
+            datetime.strptime(last_dose["date"], "%Y-%m-%d").date() + timedelta(days=cadence_days)
+        ).isoformat()
 
     coach_notes: list[str] = []
     if last_dose and days_since_last_dose == 0:
@@ -1330,12 +1338,21 @@ def build_zepbound_report(client: FitbitClient, target_date: str) -> dict[str, A
         coach_notes.append("Your dosing data is available, so we can line up appetite, recovery, and training around the shot cycle.")
 
     shot_logged_today = bool(last_dose and last_dose["date"] == target_date)
-    shot_status = "met" if shot_logged_today else "pending" if target_date == current_date_for_client(client) else "not_met"
+    is_current_day = target_date == current_date_for_client(client)
+    expected_shot_day = bool(next_due_date and target_date >= next_due_date)
+    if shot_logged_today:
+        shot_status = "met"
+    elif is_current_day and expected_shot_day:
+        shot_status = "pending"
+    else:
+        shot_status = "not_met"
     shot_summary = (
         "Shot logged today"
         if shot_status == "met"
         else "Shot still open for later today"
         if shot_status == "pending"
+        else f"Next shot likely due {next_due_date}"
+        if next_due_date and target_date < next_due_date
         else "No shot logged for this date"
     )
 
@@ -1345,6 +1362,7 @@ def build_zepbound_report(client: FitbitClient, target_date: str) -> dict[str, A
         "last_dose": last_dose,
         "days_since_last_dose": days_since_last_dose,
         "days_between_last_two_doses": days_between_last_two,
+        "next_due_date": next_due_date,
         "goal_status": {
             "shot_logged": {
                 "required": goals["shot_logging_required"],
@@ -1406,16 +1424,114 @@ def build_daily_wins(client: FitbitClient, target_date: str) -> list[dict[str, A
     return wins
 
 
+def build_readiness_reasons(report: dict[str, Any]) -> list[str]:
+    stats = report["stats"]
+    reasons: list[str] = []
+
+    sleep_text = stats.get("sleep")
+    sleep_efficiency = stats.get("sleep_efficiency")
+    step_goal_pct = stats.get("step_goal_pct") or 0
+    zone_minutes = stats.get("zone_minutes") or 0
+    movement_minutes = stats.get("movement_minutes") or 0
+
+    if sleep_text and sleep_text != "n/a":
+        reasons.append(f"sleep was {sleep_text}")
+    if sleep_efficiency is not None and sleep_efficiency < 85:
+        reasons.append(f"sleep efficiency was {sleep_efficiency}")
+    if zone_minutes < 20:
+        reasons.append(f"true exercise dose is still low at {zone_minutes} zone minutes")
+    if step_goal_pct < 80:
+        reasons.append(f"daily movement is only {step_goal_pct}% of your step goal")
+    elif movement_minutes >= 120:
+        reasons.append(f"you do have plenty of base movement at {movement_minutes} movement minutes")
+
+    return reasons
+
+
+def detect_manual_sleep_context(text: str) -> dict[str, bool]:
+    lowered = text.lower()
+    forgot_fitbit = any(
+        phrase in lowered
+        for phrase in [
+            "forgot to wear my fitbit to bed",
+            "didn't wear my fitbit to bed",
+            "did not wear my fitbit to bed",
+            "forgot my fitbit at night",
+            "fitbit to bed",
+        ]
+    )
+    slept_well = any(
+        phrase in lowered
+        for phrase in [
+            "slept well",
+            "good night sleep",
+            "good night's sleep",
+            "good nights sleep",
+            "got good sleep",
+            "slept great",
+        ]
+    )
+    return {
+        "forgot_fitbit": forgot_fitbit,
+        "slept_well": slept_well,
+    }
+
+
+def recent_manual_sleep_note(client: FitbitClient, target_date: str) -> dict[str, bool] | None:
+    for item in reversed(client.read_recent_interactions(limit=12)):
+        if item.get("date_context") != target_date:
+            continue
+        flags = detect_manual_sleep_context(item.get("message", ""))
+        if flags["forgot_fitbit"] or flags["slept_well"]:
+            return flags
+    return None
+
+
+def apply_recent_sleep_context(client: FitbitClient, reply: str, target_date: str) -> str:
+    flags = recent_manual_sleep_note(client, target_date)
+    if not flags:
+        return reply
+    if flags["forgot_fitbit"] and flags["slept_well"]:
+        return (
+            f"{reply} You told me Fitbit missed last night but you actually slept well, "
+            "so I do not want to treat the missing sleep data as automatic bad recovery."
+        )
+    if flags["slept_well"]:
+        return f"{reply} You also told me sleep was better than the device captured, so I want to keep that in mind."
+    return reply
+
+
 def format_coach_reply(report: dict[str, Any]) -> str:
     stats = report["stats"]
     notes = " ".join(report["notes"])
+    reasons = build_readiness_reasons(report)
+    why_line = f"My main reason is that {reasons[0]}." if reasons else "My main reason is that recovery does not quite justify a green light."
     return (
-        f"{report['date']}: readiness is {report['readiness']}. {report['prescription']} "
+        f"{report['date']}: readiness is {report['readiness']}. {why_line} {report['prescription']} "
         f"Steps are {stats['steps']} of {stats['step_goal']} ({stats['step_goal_pct']}%), "
         f"zone minutes are {stats['zone_minutes']} "
         f"({stats['fat_burn_zone_minutes']} fat burn, {stats['cardio_zone_minutes']} cardio, {stats['peak_zone_minutes']} peak), "
         f"sleep is {stats['sleep']} with efficiency {stats['sleep_efficiency']}, and resting HR is {stats['resting_hr']}. "
         f"{notes}"
+    )
+
+
+def format_sleep_context_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
+    flags = detect_manual_sleep_context(prompt)
+    coach = build_coach_report(client, target_date)
+    if flags["forgot_fitbit"] and flags["slept_well"]:
+        return (
+            "That helps. I do not want to confuse missing Fitbit sleep data with bad sleep. "
+            f"I’ll treat today’s recovery picture as better than the device alone suggests. Right now I still read the day as {coach['readiness']}, "
+            "but I would lean less conservative than if you had actually slept badly."
+        )
+    if flags["forgot_fitbit"]:
+        return (
+            "That matters. If Fitbit missed the night, I do not want to overreact to the missing sleep data. "
+            "Tell me whether you slept well, badly, or somewhere in the middle so I can coach today more honestly."
+        )
+    return (
+        "Thanks, that gives me useful context. Sleep quality matters more than device completeness, so I want to factor your report in."
     )
 
 
@@ -1523,27 +1639,53 @@ def format_goal_check_reply(client: FitbitClient, target_date: str) -> str:
     if wins:
         win_line = ", ".join(item["label"] for item in wins)
         primary_line = (
-            f"Your main goal today was {primary_goal['label'].lower()} because {primary_goal['reason'].lower()}"
+            f"I set your main goal today as {primary_goal['label'].lower()} because {primary_goal['reason'].lower()}"
             if primary_goal["status"] == "met"
-            else f"Your main goal today is {primary_goal['label'].lower()} because {primary_goal['reason'].lower()}"
+            else f"I want your main goal today to be {primary_goal['label'].lower()} because {primary_goal['reason'].lower()}"
         )
         return (
-            f"Yes. {primary_line} You already checked these boxes: {win_line}. "
+            f"Yes. {primary_line} I can already give you credit for these: {win_line}. "
             f"Steps are {step_goal['actual']} of {step_goal['target']}, and your {exercise_goal['label'].lower()} status is {exercise_goal['status'].replace('_', ' ')}."
         )
 
     return (
-        f"Not yet. Your main goal today is {primary_goal['label'].lower()}, and the current score is "
+        f"Not yet. I want your main goal today to be {primary_goal['label'].lower()}, and the current score is "
         f"{primary_goal['actual']} of {primary_goal['target']} {primary_goal['unit']}. "
         f"Steps are {step_goal['actual']} of {step_goal['target']}, and your {exercise_goal['label'].lower()} status is "
         f"{exercise_goal['status'].replace('_', ' ')}."
     )
 
 
+def format_goal_focus_reply(client: FitbitClient, target_date: str) -> str:
+    coach = build_coach_report(client, target_date)
+    primary_goal = coach["primary_goal"]
+    exercise_goal = coach["exercise_goal"]
+    step_goal = coach["goal_status"]["steps"]
+    water = build_water_report(client, target_date)
+    zepbound = build_zepbound_report(client, target_date)
+
+    lines = [
+        f"Your main goal today is {primary_goal['label'].lower()}: {primary_goal['reason']}",
+        f"Exercise goal: {exercise_goal['label']} is {exercise_goal['status'].replace('_', ' ')}.",
+        f"Step goal: {step_goal['actual']} of {step_goal['target']}.",
+        f"Water goal: {water['total_oz']} oz of a {water['minimum_target_oz']}-{water['ideal_target_oz']} oz range.",
+        f"Shot log: {zepbound['goal_status']['shot_logged']['summary']}.",
+    ]
+    if water["status"] == "behind":
+        lines.append(
+            "Water is still an active goal today. How is your drinking going so far?"
+        )
+    elif water["status"] == "close":
+        lines.append(
+            "Water is still open, but you are close. Tell me your total so far if it has changed."
+        )
+    return " ".join(lines)
+
+
 def format_workout_log_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
     parsed = parse_workout_log(prompt, target_date)
     if parsed is None:
-        return "I could not cleanly tell what workout to log yet."
+        return "I couldn't cleanly tell what workout to log yet."
     client.add_workout_log(
         parsed["workout_date"],
         parsed["workout_name"],
@@ -1554,8 +1696,8 @@ def format_workout_log_reply(client: FitbitClient, prompt: str, target_date: str
     recent = client.get_recent_workouts(limit=1)[0]
     return (
         f"Logged it. I have {recent['workout_name']} on {recent['workout_date']} as a "
-        f"{recent.get('workout_category') or 'workout'} session. That will help the coach notice patterns like "
-        f"whether this kind of session stops wrecking you over time."
+        f"{recent.get('workout_category') or 'workout'} session. That will help me notice patterns like "
+        f"whether this kind of workout stops wrecking you over time."
     )
 
 
@@ -1571,8 +1713,8 @@ def format_symptom_override_reply(client: FitbitClient, prompt: str, target_date
     if flags["very_sore"] or flags["stairs_pain"]:
         return (
             "This is a recovery day, not a character-building contest. "
-            "If stairs are painful and you are very sore, the coach should not be nudging brisk walking or strength technique tonight. "
-            "The goal now is food, hydration, sleep, and only gentle movement if it actually makes you feel better."
+            "If stairs are painful and you are very sore, I should not be nudging brisk walking or strength technique tonight. "
+            "I want the goal now to be food, hydration, sleep, and only gentle movement if it actually makes you feel better."
             f"{workout_line}"
         )
     if flags["tired"] and flags["missed_activity"]:
@@ -1583,8 +1725,8 @@ def format_symptom_override_reply(client: FitbitClient, prompt: str, target_date
             f"{workout_line}"
         )
     return (
-        "Your symptoms matter more than the app trying to sound brave. "
-        "If soreness and fatigue are high, the plan should downgrade toward recovery even if your Fitbit numbers look respectable."
+        "Your symptoms matter more than me trying to sound brave. "
+        "If soreness and fatigue are high, I want the plan to downgrade toward recovery even if your Fitbit numbers look respectable."
         f"{workout_line}"
     )
 
@@ -1604,6 +1746,101 @@ def format_today_plan_reply(client: FitbitClient, target_date: str) -> str:
         f"{shot_line}. You are {zepbound['days_since_last_dose']} days past your last Zepbound dose, with about "
         f"{zepbound['latest_entry']['estimated_amount_mg']} mg modeled in your system. "
         f"Action list: hit protein early, do some easy walking, and only push training if your body feels cooperative rather than negotiable.{win_line}"
+    )
+
+
+def extract_requested_future_activity(prompt: str) -> str | None:
+    lowered = prompt.lower()
+    patterns = [
+        r"(trx class)",
+        r"(strength class)",
+        r"(dance class)",
+        r"(orange theory(?: strength 50)?)",
+        r"(bike ride)",
+        r"(hike)",
+        r"(dance)",
+        r"(strength workout)",
+        r"(workout)",
+        r"(class)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, lowered)
+        if match:
+            return match.group(1)
+    return None
+
+
+def detect_reentry_gap_days(client: FitbitClient, target_date: str) -> int | None:
+    recent = client.read_recent_interactions(limit=5)
+    if not recent:
+        return None
+    latest = recent[-1]
+    latest_date = latest.get("date_context")
+    if latest_date:
+        try:
+            return (
+                datetime.strptime(target_date, "%Y-%m-%d").date()
+                - datetime.strptime(latest_date, "%Y-%m-%d").date()
+            ).days
+        except ValueError:
+            pass
+    timestamp = latest.get("timestamp")
+    if timestamp:
+        try:
+            latest_dt = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            current_dt = datetime.now(timezone.utc)
+            return (current_dt.date() - latest_dt.date()).days
+        except ValueError:
+            return None
+    return None
+
+
+def format_reentry_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
+    lowered = prompt.lower()
+    gap_days = detect_reentry_gap_days(client, target_date)
+    coach = build_coach_report(client, target_date)
+    reasons = build_readiness_reasons(coach)
+    main_reason = reasons[0] if reasons else "recovery does not quite justify a green light"
+
+    if "vacation" in lowered or "travel" in lowered or "traveling" in lowered:
+        return (
+            f"I’m glad you’re back. I’m reading today as {coach['readiness']} mostly because {main_reason}. "
+            "If the sleep dip was vacation sleep instead of a real life-collapse situation, I do not want to overreact to it. "
+            "If you’re home now, make tonight a catch-up sleep night and let me reassess tomorrow."
+        )
+
+    if "sick" in lowered or "ill" in lowered:
+        return (
+            f"I’m glad you’re back. I’m reading today as {coach['readiness']} mostly because {main_reason}. "
+            "If the gap was illness, I want to be conservative until your energy and legs stop sounding suspicious. "
+            "Tell me whether you were sick, traveling, on vacation, or just off-routine so I can coach the re-entry better."
+        )
+
+    if "yellow" in lowered or "why" in lowered:
+        gap_line = (
+            f" You were away for a few days, so before I get bossy I want to know whether that was vacation, travel, sickness, or just life."
+            if gap_days is not None and gap_days >= 3
+            else ""
+        )
+        sleep_line = (
+            " If the short sleep was vacation-related and you’re home now, I want catch-up sleep tonight more than I want extra ambition."
+            if coach["stats"].get("sleep_minutes", 0) < 420
+            else ""
+        )
+        return (
+            f"I’m glad you’re back. Today is {coach['readiness']} mostly because {main_reason}. "
+            f"{coach['prescription']}{gap_line}{sleep_line}"
+        )
+
+    if gap_days is not None and gap_days >= 3:
+        return (
+            "I’m glad you’re back. Before I start pretending continuity, tell me whether you were sick, traveling, on vacation, or just off-routine. "
+            "That changes how I should read the last few days and what I should ask from you tonight."
+        )
+
+    return (
+        f"I’m glad you’re back. Today looks {coach['readiness']} to me, mostly because {main_reason}. "
+        "If the recent gap had a reason like travel, sickness, or vacation sleep, tell me that and I’ll coach the re-entry like a grown-up."
     )
 
 
@@ -1643,6 +1880,36 @@ def format_tomorrow_plan_reply(client: FitbitClient, target_date: str) -> str:
     )
 
     return f"{plan} {hunger_note} {trend_note} {weekly_note}"
+
+
+def format_tomorrow_activity_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
+    activity = extract_requested_future_activity(prompt) or "that session"
+    coach = build_coach_report(client, target_date)
+    trends = build_trends_report(client, target_date, 7)
+
+    sleep_minutes = coach["stats"]["sleep_minutes"] or 0
+    zone_minutes = coach["stats"]["zone_minutes"] or 0
+    sleep_reason = f"sleep was only {coach['stats']['sleep']}" if coach["stats"]["sleep"] != "n/a" else "recovery still looks incomplete"
+
+    if sleep_minutes < 420:
+        return (
+            f"Maybe, but I would treat {activity} as conditional, not automatic. "
+            f"My hesitation is mostly that {sleep_reason}. If tonight is a real catch-up sleep night and you wake up feeling normal, "
+            f"I’m okay with {activity} tomorrow. If you still feel wrung out, I’d swap it for walking or easier movement instead."
+        )
+
+    if zone_minutes >= 45:
+        return (
+            f"Probably not another hard {activity} tomorrow unless you wake up feeling unusually fresh. "
+            "You already have a decent training load on the board, so I’d rather protect recovery than stack intensity for sport."
+        )
+
+    consistency = trends["consistency"]["step_goal_consistency"]
+    return (
+        f"Yes, {activity} is a reasonable plan for tomorrow if your body feels normal in the morning. "
+        f"My read is that today is more yellow than red, and the main caution flag is {sleep_reason}. "
+        f"If sleep improves tonight, I’m comfortable with it. Seven-day movement consistency is {consistency}, so the bigger game is staying steady, not perfect."
+    )
 
 
 def build_llm_context(client: FitbitClient, prompt: str, target_date: str) -> dict[str, Any]:
@@ -1685,6 +1952,7 @@ def llm_answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
     system_prompt = (
         "You are an elite recovery-first personal trainer and longevity coach for women’s health, "
         "with special focus on fat loss, sarcopenia prevention over age 60, and GLP-1 support. "
+        "Speak in first person and sound like one coach with a real personality, not a dashboard. "
         "Be supportive, decisive, witty, and data-driven. Use only the provided context. "
         "If data is missing or rate-limited, say so plainly. Do not invent metrics or medical claims. "
         "Prefer practical coaching actions over generic advice."
@@ -1706,10 +1974,16 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
             pass
     text = prompt.strip().lower()
     topic = detect_topic(text)
+    if topic == "sleep_context":
+        return format_sleep_context_reply(client, prompt, target_date)
+    if topic == "reentry":
+        return format_reentry_reply(client, prompt, target_date)
     if topic == "tomorrow_plan":
-        return format_tomorrow_plan_reply(client, target_date)
+        if "ok to" in text or "okay to" in text or "can i" in text:
+            return apply_recent_sleep_context(client, format_tomorrow_activity_reply(client, prompt, target_date), target_date)
+        return apply_recent_sleep_context(client, format_tomorrow_plan_reply(client, target_date), target_date)
     if topic == "today_plan":
-        return format_today_plan_reply(client, target_date)
+        return apply_recent_sleep_context(client, format_today_plan_reply(client, target_date), target_date)
     if topic == "zepbound":
         return format_zepbound_reply(build_zepbound_report(client, target_date))
     if topic == "fatloss":
@@ -1717,11 +1991,13 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
     if topic == "trends":
         return format_trends_reply(build_trends_report(client, target_date, 7))
     if topic == "coach":
-        return format_coach_reply(build_coach_report(client, target_date))
+        return apply_recent_sleep_context(client, format_coach_reply(build_coach_report(client, target_date)), target_date)
     if topic == "activity_observation":
         return format_activity_observation_reply(client, target_date)
     if topic == "goal_check":
         return format_goal_check_reply(client, target_date)
+    if topic == "goal_focus":
+        return format_goal_focus_reply(client, target_date)
     if topic == "workout_log":
         return format_workout_log_reply(client, prompt, target_date)
     if topic == "symptom_override":
@@ -1736,14 +2012,14 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
         return format_water_reply(build_water_report(client, target_date))
     if topic == "help":
         return (
-            "Try: 'What should I do today?', 'What should I aim to do tomorrow?', "
+            "Ask me things like 'What should I do today?', 'What should I aim to do tomorrow?', "
             "'How is my 7-day trend?', 'Am I losing fat or lean mass?', 'Did you notice I took a walk?', "
-            "'Did I meet my goals today?', or 'How is water going?'"
+            "'Did I meet my goals today?', 'What goals am I working on?', or 'How is water going?'"
         )
     if topic == "empty":
         return "Ask about training readiness, weekly trends, fat loss, body composition, water, or today."
     return (
-        "I didn't map that cleanly yet. Ask about today, training readiness, weekly trends, fat loss, water, or body composition."
+        "I didn't map that cleanly yet. Ask me about today, training readiness, weekly trends, fat loss, water, or body composition."
     )
 
 
@@ -1751,6 +2027,29 @@ def detect_topic(text: str) -> str:
     text = text.strip().lower()
     if not text:
         return "empty"
+    sleep_flags = detect_manual_sleep_context(text)
+    if sleep_flags["forgot_fitbit"] or ("sleep" in text and sleep_flags["slept_well"]):
+        return "sleep_context"
+    if any(
+        phrase in text
+        for phrase in [
+            "i'm back",
+            "im back",
+            "hi i'm back",
+            "hi im back",
+            "i was away",
+            "i've been away",
+            "ive been away",
+            "back from vacation",
+            "back from travel",
+            "i was on vacation",
+            "i was traveling",
+            "i was sick",
+            "i am home now",
+            "i'm home now",
+        ]
+    ):
+        return "reentry"
     if any(
         phrase in text
         for phrase in [
@@ -1774,11 +2073,27 @@ def detect_topic(text: str) -> str:
             "have i met my goals",
             "did i hit my goals",
             "what goals did i meet",
+            "what goals am i working on",
+            "what goals am i working toward",
+            "what are my goals",
+            "what am i working on",
+            "what should i be working on",
             "what have i already done well",
             "what wins do i have",
             "wins today",
         ]
     ):
+        if any(
+            phrase in text
+            for phrase in [
+                "what goals am i working on",
+                "what goals am i working toward",
+                "what are my goals",
+                "what am i working on",
+                "what should i be working on",
+            ]
+        ):
+            return "goal_focus"
         return "goal_check"
     if any(word in text for word in ["sore", "stairs", "painful", "exhausted", "fatigued"]) and any(
         word in text for word in ["i did", "i took", "workout", "class", "dance", "tired", "didn't go", "did not go", "skipped"]
@@ -1802,8 +2117,16 @@ def detect_topic(text: str) -> str:
             "what's tomorrows plan",
             "what is tomorrow's plan",
             "what's tomorrow's plan",
+            "am i ok to",
+            "am i okay to",
+            "can i go to",
+            "can i do",
+            "should i do",
         ]
     ):
+        if "tomorrow" in text:
+            return "tomorrow_plan"
+    if "tomorrow" in text and any(word in text for word in ["class", "trx", "dance", "workout", "train", "strength", "bike", "hike"]):
         return "tomorrow_plan"
     if any(phrase in text for phrase in ["what should i do today", "today plan", "plan for today", "what now"]):
         return "today_plan"

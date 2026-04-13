@@ -278,6 +278,6 @@ chatInput.addEventListener("keydown", async (event) => {
   chatForm.requestSubmit();
 });
 
-addMessage("Coach", "Ask me what to do today, whether you should train, how water is going, how fat loss is going, or where you are in the shot cycle.");
+addMessage("Coach", "Ask me what to do today, whether you should train, what goals you are working on, how water is going, how fat loss is going, or where you are in your shot cycle.");
 loadStatus().catch((error) => addMessage("Coach", error.message));
 loadHistory().catch((error) => addMessage("Coach", error.message));
