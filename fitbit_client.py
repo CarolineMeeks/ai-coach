@@ -1152,6 +1152,59 @@ def build_exercise_goal(day: dict[str, Any], goals: dict[str, Any], primary_goal
     }
 
 
+def build_training_recommendation(client: FitbitClient, target_date: str) -> dict[str, str]:
+    coach = build_coach_report(client, target_date)
+    stats = coach["stats"]
+    recent_workouts = client.get_recent_workouts(limit=3)
+    recent_strength = any(
+        (item.get("workout_category") == "strength") or ("strength" in (item.get("workout_name") or "").lower())
+        for item in recent_workouts
+    )
+    pair_flag = bool(coach.get("recovery_baseline", {}).get("pair_flag"))
+    rhr_elevated = bool(coach.get("recovery_baseline", {}).get("resting_hr_elevated"))
+    hrv_suppressed = bool(coach.get("recovery_baseline", {}).get("hrv_suppressed"))
+    already_moved_well = stats["steps"] >= 10000 or stats["movement_minutes"] >= 90
+
+    if pair_flag:
+        return {
+            "primary": "PT or recovery",
+            "why": "your resting HR is up and HRV is down versus baseline, which is a real recovery caution flag",
+            "prompt": "I recommend PT or recovery today, not a hard class. What sounds more realistic: PT, a walk, or full recovery?",
+        }
+
+    if coach["readiness"] == "amber":
+        return {
+            "primary": "Recovery",
+            "why": "recovery is not convincing enough for a real training push",
+            "prompt": "I recommend recovery today. If you want to do something useful, make it PT or an easy walk rather than a real workout.",
+        }
+
+    if coach["readiness"] == "yellow":
+        if already_moved_well and (rhr_elevated or hrv_suppressed):
+            return {
+                "primary": "PT or enough-for-today",
+                "why": "you already banked solid movement and recovery is giving a yellow light, not a green one",
+                "prompt": "You already banked enough movement that I do not think you need more. If you still want something useful, I recommend PT over a harder session.",
+            }
+        if recent_strength:
+            return {
+                "primary": "PT or VR strength only if moderate",
+                "why": "you have recent strength load already, so I want a lower-drama second option",
+                "prompt": "I would lean PT today. If you really want training, make it a moderate VR strength session, not a prove-something workout.",
+            }
+        return {
+            "primary": "Class or VR strength",
+            "why": "recovery is decent enough and there is no strong veto from recent load",
+            "prompt": "I think a real workout is reasonable today. My bias is class or VR strength if you want training, with PT as the lower-load backup.",
+        }
+
+    return {
+        "primary": "Real workout",
+        "why": "readiness is good and I do not see a strong recovery veto",
+        "prompt": "I recommend a real workout today. Class or VR strength are both good options unless life logistics make PT the smarter fit.",
+    }
+
+
 def build_coach_report(client: FitbitClient, target_date: str) -> dict[str, Any]:
     day = summarize_day(get_day_snapshot(client, target_date))
     recovery_baseline = build_recovery_baseline(client, target_date, 7)
@@ -1841,12 +1894,14 @@ def format_today_plan_reply(client: FitbitClient, target_date: str) -> str:
     fatloss = build_fatloss_report(client, target_date, 30)
     zepbound = build_zepbound_report(client, target_date)
     wins = build_daily_wins(client, target_date)
+    recommendation = build_training_recommendation(client, target_date)
     primary_goal = coach["primary_goal"]
     win_line = f" Wins today: {', '.join(item['label'] for item in wins)}." if wins else ""
     shot_line = zepbound["goal_status"]["shot_logged"]["summary"]
     return (
         f"Today is a {coach['readiness']} day. {coach['prescription']} "
         f"The main goal is {primary_goal['label'].lower()}: {primary_goal['reason']} "
+        f"My stronger recommendation is {recommendation['primary'].lower()} because {recommendation['why']}. "
         f"Your 30-day fat-loss read is {fatloss['verdict']}, so the priority is protecting lean mass while staying consistent. "
         f"{shot_line}. You are {zepbound['days_since_last_dose']} days past your last Zepbound dose, with about "
         f"{zepbound['latest_entry']['estimated_amount_mg']} mg modeled in your system. "
@@ -2072,6 +2127,22 @@ def format_strength_technique_reply() -> str:
     )
 
 
+def format_recovery_plan_reply(client: FitbitClient, target_date: str) -> str:
+    coach = build_coach_report(client, target_date)
+    stats = coach["stats"]
+    recommendation = build_training_recommendation(client, target_date)
+    walk_line = (
+        "You already have enough movement banked, so I do not need another formal walk target."
+        if stats["steps"] >= 10000 or stats["movement_minutes"] >= 90
+        else "If you want movement, keep it easy: a relaxed walk, gentle stretching, light yoga, or easy mobility is enough."
+    )
+    return (
+        f"Recovery today would look like this: no hard class, no proving-a-point workout, protein on purpose, hydration handled, and an early-enough night to help tomorrow. "
+        f"{walk_line} If you still want something useful, I would choose PT over a real training session. "
+        f"My reason is that {recommendation['why']}."
+    )
+
+
 def build_llm_context(client: FitbitClient, prompt: str, target_date: str) -> dict[str, Any]:
     topic = detect_topic(prompt)
     context: dict[str, Any] = {"date": target_date, "topic_hint": topic}
@@ -2146,6 +2217,8 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
         if "ok to" in text or "okay to" in text or "can i" in text or "should i go to" in text or "should i try to make it to" in text:
             return apply_recent_sleep_context(client, format_today_activity_reply(client, prompt, target_date), target_date)
         return apply_recent_sleep_context(client, format_today_plan_reply(client, target_date), target_date)
+    if topic == "recovery_plan":
+        return apply_recent_sleep_context(client, format_recovery_plan_reply(client, target_date), target_date)
     if topic == "strength_technique":
         return format_strength_technique_reply()
     if topic == "zepbound":
@@ -2304,6 +2377,24 @@ def detect_topic(text: str) -> str:
         return "today_plan"
     if "strength technique" in text:
         return "strength_technique"
+    if any(
+        phrase in text
+        for phrase in [
+            "what would recovery look like",
+            "what does recovery look like",
+            "what should recovery look like",
+            "what does a recovery day look like",
+            "what would a recovery day look like",
+            "what do you suggest for recovery",
+            "what do you suggest for a recovery day",
+            "what should i do for recovery",
+            "what do you recommend for recovery",
+            "what sort of recovery",
+            "what kind of recovery",
+            "what kind of recovery day",
+        ]
+    ):
+        return "recovery_plan"
     if "water" in text or "hydration" in text or parse_water_oz(text) is not None:
         return "water"
     if any(word in text for word in ["zepbound", "shot", "dose", "dosing", "glp", "medication"]):

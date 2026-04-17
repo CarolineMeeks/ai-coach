@@ -5,6 +5,7 @@ const state = {
   fatloss: null,
   zepbound: null,
   water: null,
+  promptedDate: null,
 };
 
 const dateInput = document.querySelector("#date-input");
@@ -68,6 +69,7 @@ function setSummary(payload) {
   const goalSummary = primaryGoal.kind === "recovery_walk"
     ? `${primaryGoal.actual} / ${primaryGoal.target} movement minutes`
     : `${primaryGoal.actual} / ${primaryGoal.target} ${primaryGoal.unit}`;
+  const planningPrompt = buildPlanningPrompt(payload.coach);
   summaryCard.innerHTML = `
     <p class="label">Today</p>
     <h2>${readiness.toUpperCase()}</h2>
@@ -79,12 +81,59 @@ function setSummary(payload) {
       <p class="goal-meta">Status: ${goalStatus}. Progress: ${goalSummary}.</p>
       <p class="goal-meta">Combined exercise goal: ${exerciseStatus}.</p>
     </div>
+    ${planningPrompt ? `<p class="meta"><strong>Plan Prompt:</strong> ${planningPrompt}</p>` : ""}
     <p class="meta">Fat-loss read: ${fatloss}. Zepbound: ${zepboundText}.</p>
   `;
   const cache = payload.cache_status;
   cacheBanner.hidden = false;
   cacheBanner.textContent = cache.message;
   cacheBanner.dataset.mode = cache.used_stale ? "stale" : cache.used_cache ? "cache" : "fresh";
+}
+
+function currentLocalDateIso() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function buildPlanningPrompt(coach) {
+  if (!coach || !state.date || state.date !== currentLocalDateIso()) {
+    return null;
+  }
+  const readiness = coach.readiness;
+  const hour = new Date().getHours();
+  const decentReadiness = readiness === "green" || readiness === "yellow";
+  if (!decentReadiness) {
+    return null;
+  }
+  const stats = coach.stats || {};
+  const movedWell = (stats.steps || 0) >= 10000 || (stats.movement_minutes || 0) >= 90;
+  const rhrElevated = stats.resting_hr_baseline != null && stats.resting_hr != null && stats.resting_hr >= stats.resting_hr_baseline + 3;
+  const hrvSuppressed = stats.hrv_baseline != null && stats.hrv_daily_rmssd != null && stats.hrv_daily_rmssd <= stats.hrv_baseline * 0.85;
+  if (hour >= 20) {
+    return "It is late enough that I care more about tomorrow now. What is the plan: class, PT, VR strength, walk, or recovery?";
+  }
+  if (readiness === "yellow" && movedWell && (rhrElevated || hrvSuppressed)) {
+    return "You already banked solid movement, and recovery is not fully happy. I would lean PT or recovery over a harder session today.";
+  }
+  if (readiness === "yellow" && movedWell) {
+    return "You already banked a real movement win. The question now is whether you want a second training stimulus or whether the walk is enough.";
+  }
+  return "I think you are good enough for something useful today. What is the plan: class, PT, VR strength, walk, or recovery?";
+}
+
+function maybePromptForPlan() {
+  const prompt = buildPlanningPrompt(state.coach);
+  if (!prompt) {
+    return;
+  }
+  if (state.promptedDate === `${state.date}:${new Date().getHours() >= 20 ? "tomorrow" : "today"}`) {
+    return;
+  }
+  state.promptedDate = `${state.date}:${new Date().getHours() >= 20 ? "tomorrow" : "today"}`;
+  addMessage("Coach", prompt);
 }
 
 function setMetrics() {
@@ -205,6 +254,7 @@ async function loadStatus() {
   state.water = null;
   await loadToday();
   await loadSecondary();
+  maybePromptForPlan();
 }
 
 async function loadHistory() {
