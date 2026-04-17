@@ -1571,6 +1571,72 @@ def build_daily_wins(client: FitbitClient, target_date: str) -> list[dict[str, A
     return wins
 
 
+def build_weekly_goal_summary(client: FitbitClient, end_date: str, days: int = 7) -> dict[str, Any]:
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    daily: list[dict[str, Any]] = []
+    primary_goal_met_days = 0
+    exercise_goal_met_days = 0
+    recovery_goal_days = 0
+    build_goal_days = 0
+    ambitious_goal_days = 0
+
+    for offset in range(days - 1, -1, -1):
+        current = end - timedelta(days=offset)
+        report = build_coach_report(client, current.isoformat())
+        primary_status = report["primary_goal"]["status"]
+        exercise_status = report["exercise_goal"]["status"]
+        primary_kind = report["primary_goal"]["kind"]
+        readiness = report["readiness"]
+        if primary_status == "met":
+            primary_goal_met_days += 1
+        if exercise_status == "met":
+            exercise_goal_met_days += 1
+        if primary_kind == "recovery_walk" or readiness in {"amber", "trained-but-watch-recovery"}:
+            recovery_goal_days += 1
+        elif readiness == "yellow":
+            build_goal_days += 1
+        elif readiness == "green":
+            ambitious_goal_days += 1
+        daily.append(
+            {
+                "date": current.isoformat(),
+                "primary_goal": report["primary_goal"]["label"],
+                "primary_kind": primary_kind,
+                "primary_status": primary_status,
+                "exercise_goal": report["exercise_goal"]["label"],
+                "exercise_status": exercise_status,
+                "readiness": readiness,
+            }
+        )
+
+    if primary_goal_met_days >= 5:
+        consistency = "strong"
+    elif primary_goal_met_days >= 3:
+        consistency = "decent"
+    else:
+        consistency = "shaky"
+
+    return {
+        "days": days,
+        "primary_goal_met_days": primary_goal_met_days,
+        "exercise_goal_met_days": exercise_goal_met_days,
+        "recovery_goal_days": recovery_goal_days,
+        "build_goal_days": build_goal_days,
+        "ambitious_goal_days": ambitious_goal_days,
+        "consistency": consistency,
+        "daily": daily,
+    }
+
+
+def build_previous_window_fatloss_report(client: FitbitClient, end_date: str, days: int) -> dict[str, Any] | None:
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    previous_end = end - timedelta(days=days)
+    try:
+        return build_fatloss_report(client, previous_end.isoformat(), days)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_readiness_reasons(report: dict[str, Any]) -> list[str]:
     stats = report["stats"]
     reasons: list[str] = []
@@ -1716,6 +1782,143 @@ def format_fatloss_reply(report: dict[str, Any]) -> str:
         f"Over this window, weight changed {changes['weight_kg']} kg, fat mass changed {changes['fat_mass_kg']} kg, "
         f"and lean mass changed {changes['lean_mass_kg']} kg. {notes}"
     )
+
+
+def kg_to_lb(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return round(value * 2.20462, 1)
+
+
+def format_weekly_summary_reply(client: FitbitClient, target_date: str) -> str:
+    trends = build_trends_report(client, target_date, 7)
+    fatloss = build_fatloss_report(client, target_date, 7)
+    previous_fatloss = build_previous_window_fatloss_report(client, target_date, 7)
+    goal_summary = build_weekly_goal_summary(client, target_date, 7)
+    latest = fatloss.get("latest") or {}
+    changes = fatloss.get("changes") or {}
+    latest_weight_lb = kg_to_lb(latest.get("weight_kg"))
+    fat_change_lb = kg_to_lb(changes.get("fat_mass_kg"))
+    lean_change_lb = kg_to_lb(changes.get("lean_mass_kg"))
+    weight_change_lb = kg_to_lb(changes.get("weight_kg"))
+    summary_parts = [
+        f"Here’s the 7-day read: you averaged about {round(trends['averages']['steps'])} steps and {trends['averages']['sleep']} of sleep a night."
+    ]
+
+    if latest_weight_lb is not None:
+        summary_parts.append(
+            f"Your latest weigh-in was {latest_weight_lb} lb"
+            + (
+                f" at {latest.get('fat_pct')}% body fat."
+                if latest.get("fat_pct") is not None
+                else "."
+            )
+        )
+
+    if weight_change_lb is not None:
+        summary_parts.append(f"Scale change over the week was {weight_change_lb:+.1f} lb.")
+    if fat_change_lb is not None and lean_change_lb is not None:
+        summary_parts.append(
+            f"Estimated fat mass changed {fat_change_lb:+.1f} lb and lean mass changed {lean_change_lb:+.1f} lb."
+        )
+    elif fat_change_lb is not None:
+        summary_parts.append(f"Estimated fat mass changed {fat_change_lb:+.1f} lb.")
+
+    if previous_fatloss and previous_fatloss.get("changes"):
+        previous_changes = previous_fatloss["changes"]
+        previous_fat = previous_changes.get("fat_mass_kg")
+        previous_lean = previous_changes.get("lean_mass_kg")
+        fat_change = changes.get("fat_mass_kg")
+        lean_change = changes.get("lean_mass_kg")
+        if fat_change is not None and previous_fat is not None:
+            if fat_change < previous_fat:
+                summary_parts.append("This week looks a little better than the previous one on fat-loss direction.")
+            elif fat_change > previous_fat:
+                summary_parts.append("This week looks a little softer than the previous one on fat-loss direction, so I care more about consistency than drama.")
+        if lean_change is not None and previous_lean is not None and lean_change > previous_lean:
+            summary_parts.append("Lean-mass protection looks a bit better this week than last week.")
+
+    if fatloss["verdict"] == "mostly water noise":
+        summary_parts.append("This still looks more like consistency work than dramatic fat-loss theater, which is fine.")
+    else:
+        verdict_map = {
+            "fat loss with lean mass protected": "I’d call this a decent week for fat loss while keeping lean mass reasonably intact.",
+            "mixed loss": "I see some fat-loss movement here, but I also want more attention on lean-mass protection.",
+            "slow or unclear": "I would call this steady but not dramatic yet, which is still real progress if the direction holds.",
+            "insufficient data": "We still need a little more body-comp history before I want to sound too certain.",
+        }
+        summary_parts.append(verdict_map.get(fatloss["verdict"], f"My fat-loss read this week is {fatloss['verdict']}."))
+
+    if goal_summary["primary_goal_met_days"] >= 3:
+        summary_parts.append(
+            f"You hit your coach-set main goal {goal_summary['primary_goal_met_days']} out of 7 days, which is {goal_summary['consistency']} consistency."
+        )
+    else:
+        summary_parts.append(
+            f"You hit your coach-set main goal {goal_summary['primary_goal_met_days']} out of 7 days, so the improvement lever is still follow-through on the daily plan."
+        )
+
+    if goal_summary["exercise_goal_met_days"] >= 1:
+        summary_parts.append(
+            f"You fully hit the exercise goal on {goal_summary['exercise_goal_met_days']} of 7 days."
+        )
+
+    if goal_summary["recovery_goal_days"] >= 4:
+        summary_parts.append(
+            "This was a more recovery-biased week, so those goal hits were solid follow-through on a conservative plan rather than a big ambitious training week."
+        )
+    elif goal_summary["ambitious_goal_days"] >= 3:
+        summary_parts.append(
+            "This was a more ambitious training week, so the consistency is worth extra credit."
+        )
+    else:
+        summary_parts.append(
+            "This looked like more of a build-the-base week than a swing-for-the-fences week."
+        )
+
+    challenge_bits: list[str] = []
+    avg_sleep_text = trends["averages"]["sleep"]
+    avg_sleep_minutes = 0
+    if avg_sleep_text and avg_sleep_text != "0m":
+        hours_match = re.search(r"(\d+)h", avg_sleep_text)
+        minutes_match = re.search(r"(\d+)m", avg_sleep_text)
+        avg_sleep_minutes = (int(hours_match.group(1)) * 60 if hours_match else 0) + (int(minutes_match.group(1)) if minutes_match else 0)
+    if avg_sleep_minutes and avg_sleep_minutes < 420:
+        challenge_bits.append("sleep was not especially generous")
+    short_sleep_days = 0
+    elevated_rhr_days = 0
+    softer_hrv_days = 0
+    avg_rhr = trends["averages"].get("resting_hr")
+    avg_hrv = trends["averages"].get("hrv_daily_rmssd")
+    for item in trends.get("daily", []):
+        sleep_text = item.get("sleep") or ""
+        hours_match = re.search(r"(\d+)h", sleep_text)
+        minutes_match = re.search(r"(\d+)m", sleep_text)
+        sleep_minutes = (int(hours_match.group(1)) * 60 if hours_match else 0) + (int(minutes_match.group(1)) if minutes_match else 0)
+        if sleep_minutes and sleep_minutes < 420:
+            short_sleep_days += 1
+        if avg_rhr is not None and item.get("resting_hr") is not None and item["resting_hr"] >= avg_rhr + 3:
+            elevated_rhr_days += 1
+        if avg_hrv is not None and item.get("hrv_daily_rmssd") is not None and item["hrv_daily_rmssd"] <= avg_hrv * 0.85:
+            softer_hrv_days += 1
+
+    if short_sleep_days >= 2:
+        challenge_bits.append(f"there were {short_sleep_days} shorter-sleep nights")
+    if elevated_rhr_days >= 2:
+        challenge_bits.append("resting heart rate ran a little hot on multiple days")
+    if softer_hrv_days >= 2:
+        challenge_bits.append("HRV was softer than usual on multiple days")
+    if fatloss["verdict"] in {"slow or unclear", "mixed loss", "mostly water noise"}:
+        challenge_bits.append("body-comp progress was still a little muddy")
+    if goal_summary["primary_goal_met_days"] < 7:
+        challenge_bits.append("daily follow-through was not perfect")
+
+    if challenge_bits:
+        summary_parts.append(
+            "The main challenge this week was that " + ", and ".join(challenge_bits) + "."
+        )
+
+    return " ".join(summary_parts)
 
 
 def format_zepbound_reply(report: dict[str, Any]) -> str:
@@ -2143,6 +2346,33 @@ def format_recovery_plan_reply(client: FitbitClient, target_date: str) -> str:
     )
 
 
+def format_time_crunch_reply(client: FitbitClient, target_date: str) -> str:
+    recommendation = build_training_recommendation(client, target_date)
+    coach = build_coach_report(client, target_date)
+    stats = coach["stats"]
+
+    if recommendation["primary"] == "Recovery":
+        return (
+            "You are short on time, so I would make this gloriously simple: skip the workout, eat protein on purpose, handle hydration, "
+            "and set yourself up for a better night of sleep. That is the highest-return move today."
+        )
+
+    if recommendation["primary"] in {"PT or recovery", "PT or enough-for-today"}:
+        return (
+            "Since time is tight, I would choose PT or call the walk enough. You already have solid movement banked, and I do not think today needs a full second training stimulus."
+        )
+
+    if stats["steps"] >= 10000:
+        return (
+            "Because time is tight and you already have over 10K steps, I would either do a short PT session or call that enough for today. "
+            "A full workout is optional, not mandatory."
+        )
+
+    return (
+        "If you want the highest return on limited time, I would do the simplest useful thing: PT if you want structured work, or a real class/VR strength session only if you genuinely have the energy for it."
+    )
+
+
 def build_llm_context(client: FitbitClient, prompt: str, target_date: str) -> dict[str, Any]:
     topic = detect_topic(prompt)
     context: dict[str, Any] = {"date": target_date, "topic_hint": topic}
@@ -2169,13 +2399,63 @@ def build_llm_context(client: FitbitClient, prompt: str, target_date: str) -> di
         except Exception as exc:  # noqa: BLE001
             context["fatloss_error"] = str(exc)
 
-    if topic in {"trends", "tomorrow_plan", "other"}:
+    if topic in {"trends", "tomorrow_plan", "weekly_summary", "other"}:
         try:
             context["trends"] = build_trends_report(client, target_date, 7)
         except Exception as exc:  # noqa: BLE001
             context["trends_error"] = str(exc)
 
+    if topic in {"weekly_summary", "other"}:
+        try:
+            context["weekly_summary_preview"] = format_weekly_summary_reply(client, target_date)
+        except Exception as exc:  # noqa: BLE001
+            context["weekly_summary_error"] = str(exc)
+
+    try:
+        context["recent_workouts"] = client.get_recent_workouts(limit=3)
+    except Exception as exc:  # noqa: BLE001
+        context["recent_workouts_error"] = str(exc)
+
+    try:
+        context["recent_interactions"] = client.read_recent_interactions(limit=5)
+    except Exception as exc:  # noqa: BLE001
+        context["recent_interactions_error"] = str(exc)
+
     return context
+
+
+def llm_route_intent(client: FitbitClient, prompt: str, target_date: str) -> dict[str, Any]:
+    context = build_llm_context(client, prompt, target_date)
+    system_prompt = (
+        "You are an intent router for a recovery-first coaching app. "
+        "Classify the user's message into exactly one internal topic from this list: "
+        "sleep_context, reentry, tomorrow_plan, today_plan, zepbound, fatloss, trends, weekly_summary, coach, "
+        "activity_observation, goal_check, goal_focus, workout_log, symptom_override, water, "
+        "recovery_plan, strength_technique, help, other. "
+        "Return only compact JSON with keys: topic, activity, confidence, reason. "
+        "activity may be null. confidence must be a number from 0 to 1. "
+        "Use the provided structured context, but do not answer the user question."
+    )
+    user_prompt = (
+        f"User question: {prompt}\n"
+        f"Reference date: {target_date}\n"
+        "Structured context:\n"
+        f"{json.dumps(context, indent=2)}"
+    )
+    raw = client.openai_response(system_prompt, user_prompt)
+    try:
+        routed = json.loads(raw)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            raise FitbitConfigError("OpenAI intent router did not return valid JSON.")
+        routed = json.loads(match.group(0))
+    return {
+        "topic": str(routed.get("topic") or "other"),
+        "activity": routed.get("activity"),
+        "confidence": float(routed.get("confidence") or 0),
+        "reason": str(routed.get("reason") or ""),
+    }
 
 
 def llm_answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
@@ -2198,25 +2478,35 @@ def llm_answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
 
 
 def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
+    text = prompt.strip().lower()
+    if detect_topic(text) == "weekly_summary":
+        return format_weekly_summary_reply(client, target_date)
+    routed_activity = None
     if client.config.openai_api_key:
         try:
-            return llm_answer_chat(client, prompt, target_date)
+            routed = llm_route_intent(client, prompt, target_date)
+            topic = routed["topic"]
+            routed_activity = routed.get("activity")
         except Exception:
-            pass
-    text = prompt.strip().lower()
-    topic = detect_topic(text)
+            topic = detect_topic(text)
+    else:
+        topic = detect_topic(text)
     if topic == "sleep_context":
         return format_sleep_context_reply(client, prompt, target_date)
     if topic == "reentry":
         return format_reentry_reply(client, prompt, target_date)
     if topic == "tomorrow_plan":
-        if "ok to" in text or "okay to" in text or "can i" in text:
-            return apply_recent_sleep_context(client, format_tomorrow_activity_reply(client, prompt, target_date), target_date)
+        if "ok to" in text or "okay to" in text or "can i" in text or routed_activity:
+            routed_prompt = f"{prompt}\nActivity: {routed_activity}" if routed_activity else prompt
+            return apply_recent_sleep_context(client, format_tomorrow_activity_reply(client, routed_prompt, target_date), target_date)
         return apply_recent_sleep_context(client, format_tomorrow_plan_reply(client, target_date), target_date)
     if topic == "today_plan":
-        if "ok to" in text or "okay to" in text or "can i" in text or "should i go to" in text or "should i try to make it to" in text:
-            return apply_recent_sleep_context(client, format_today_activity_reply(client, prompt, target_date), target_date)
+        if "ok to" in text or "okay to" in text or "can i" in text or "should i go to" in text or "should i try to make it to" in text or routed_activity:
+            routed_prompt = f"{prompt}\nActivity: {routed_activity}" if routed_activity else prompt
+            return apply_recent_sleep_context(client, format_today_activity_reply(client, routed_prompt, target_date), target_date)
         return apply_recent_sleep_context(client, format_today_plan_reply(client, target_date), target_date)
+    if topic == "time_crunch":
+        return apply_recent_sleep_context(client, format_time_crunch_reply(client, target_date), target_date)
     if topic == "recovery_plan":
         return apply_recent_sleep_context(client, format_recovery_plan_reply(client, target_date), target_date)
     if topic == "strength_technique":
@@ -2225,6 +2515,8 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
         return format_zepbound_reply(build_zepbound_report(client, target_date))
     if topic == "fatloss":
         return format_fatloss_reply(build_fatloss_report(client, target_date, 30))
+    if topic == "weekly_summary":
+        return format_weekly_summary_reply(client, target_date)
     if topic == "trends":
         return format_trends_reply(build_trends_report(client, target_date, 7))
     if topic == "coach":
@@ -2255,9 +2547,12 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
         )
     if topic == "empty":
         return "Ask about training readiness, weekly trends, fat loss, body composition, water, or today."
-    return (
-        "I didn't map that cleanly yet. Ask me about today, training readiness, weekly trends, fat loss, water, or body composition."
-    )
+    if client.config.openai_api_key:
+        try:
+            return llm_answer_chat(client, prompt, target_date)
+        except Exception:
+            pass
+    return "I didn't map that cleanly yet. Ask me about today, training readiness, weekly trends, fat loss, water, or body composition."
 
 
 def detect_topic(text: str) -> str:
@@ -2380,6 +2675,23 @@ def detect_topic(text: str) -> str:
     if any(
         phrase in text
         for phrase in [
+            "running short on time",
+            "short on time",
+            "not much time today",
+            "pressed for time",
+            "what should i do if i'm short on time",
+            "only have a few minutes",
+            "only have a few min",
+            "i only have a few minutes",
+            "i only have a few min",
+            "don't have much time",
+            "do not have much time",
+        ]
+    ):
+        return "time_crunch"
+    if any(
+        phrase in text
+        for phrase in [
             "what would recovery look like",
             "what does recovery look like",
             "what should recovery look like",
@@ -2401,6 +2713,24 @@ def detect_topic(text: str) -> str:
         return "zepbound"
     if any(word in text for word in ["fat", "lean", "body comp", "bodycomp", "muscle"]):
         return "fatloss"
+    if any(
+        phrase in text
+        for phrase in [
+            "weekly summary",
+            "summary of my progress for the last 7 days",
+            "summary of my progress for the past 7 days",
+            "summary for my weightloss group",
+            "summary for my weight loss group",
+            "weekly report for my facebook weightloss group",
+            "weekly report for my facebook weight loss group",
+            "writing my weekly report for my facebook weightloss group",
+            "writing my weekly report for my facebook weight loss group",
+            "weekly report for my weightloss group",
+            "weekly report for my weight loss group",
+            "facebook summary",
+        ]
+    ):
+        return "weekly_summary"
     if any(word in text for word in ["trend", "week", "7 day", "consistency", "average"]):
         return "trends"
     if any(word in text for word in ["train", "today", "recovery", "ready", "workout"]):
