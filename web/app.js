@@ -96,6 +96,13 @@ function setMetrics() {
   const latest = state.fatloss.latest;
   const zep = state.zepbound;
   const water = state.water;
+  const rhrBaseline = stats.resting_hr_baseline;
+  const hrvToday = stats.hrv_daily_rmssd;
+  const hrvBaseline = stats.hrv_baseline;
+  const rhrDelta = rhrBaseline != null && stats.resting_hr != null ? (stats.resting_hr - rhrBaseline).toFixed(1) : null;
+  const hrvDelta = hrvBaseline != null && hrvToday != null ? (hrvToday - hrvBaseline).toFixed(1) : null;
+  const rhrTrend = rhrDelta == null ? "n/a" : Number(rhrDelta) > 0 ? `${rhrDelta} above 7d avg` : Number(rhrDelta) < 0 ? `${Math.abs(Number(rhrDelta)).toFixed(1)} below 7d avg` : "at 7d avg";
+  const hrvTrend = hrvDelta == null ? "n/a" : Number(hrvDelta) > 0 ? `${hrvDelta} above 7d avg` : Number(hrvDelta) < 0 ? `${Math.abs(Number(hrvDelta)).toFixed(1)} below 7d avg` : "at 7d avg";
   const metrics = [
     ["Main Goal", `${state.coach.primary_goal.label} (${state.coach.primary_goal.status.replaceAll("_", " ")})`],
     ["Exercise Goal", `${state.coach.exercise_goal.label}: ${state.coach.exercise_goal.status.replaceAll("_", " ")}`],
@@ -104,6 +111,9 @@ function setMetrics() {
     ["Steps", `${stats.steps} / ${stats.step_goal}`],
     ["Sleep", `${stats.sleep} (${stats.sleep_efficiency}% eff.)`],
     ["Resting HR", `${stats.resting_hr}`],
+    ["Resting HR Trend", rhrBaseline != null ? `${rhrTrend} (${rhrBaseline} avg)` : "n/a"],
+    ["HRV", hrvToday != null ? `${hrvToday} ms` : "n/a"],
+    ["HRV Trend", hrvBaseline != null && hrvToday != null ? `${hrvTrend} (${hrvBaseline} avg)` : "n/a"],
     ["Body Fat", `${latest.fat_pct}%`],
     ["Lean Mass", `${latest.lean_mass_kg} kg`],
     ["Zepbound", `${zep.latest_entry.estimated_amount_mg} mg in system`],

@@ -414,12 +414,18 @@ def get_day_snapshot(client: FitbitClient, target_date: str) -> dict[str, Any]:
     sleep = client.get_json(f"/1.2/user/-/sleep/date/{target_date}.json")
     profile = client.get_json("/1/user/-/profile.json")
     active_zone = client.get_json(f"/1/user/-/activities/active-zone-minutes/date/{target_date}/1d.json")
+    try:
+        # Inference from Fitbit's web API patterns: some accounts expose daily HRV here.
+        hrv = client.get_json(f"/1/user/-/hrv/date/{target_date}.json")
+    except Exception:  # noqa: BLE001
+        hrv = {}
     return {
         "date": target_date,
         "daily_activity": activity,
         "active_zone_minutes": active_zone,
         "sleep": sleep,
         "profile": profile,
+        "hrv": hrv,
     }
 
 
@@ -446,6 +452,10 @@ def summarize_day(snapshot: dict[str, Any]) -> dict[str, Any]:
     light_minutes = int(summary.get("lightlyActiveMinutes", 0))
     sedentary_minutes = int(summary.get("sedentaryMinutes", 0))
     resting_hr = summary.get("restingHeartRate")
+    hrv_items = snapshot.get("hrv", {}).get("hrv", [])
+    hrv_entry = hrv_items[0].get("value", {}) if hrv_items else {}
+    hrv_daily_rmssd = hrv_entry.get("dailyRmssd")
+    hrv_deep_rmssd = hrv_entry.get("deepRmssd")
     azm_items = snapshot.get("active_zone_minutes", {}).get("activities-active-zone-minutes", [])
     azm_entry = azm_items[0].get("value", {}) if azm_items else {}
     zone_minutes = int(azm_entry.get("activeZoneMinutes", 0) or 0)
@@ -463,6 +473,8 @@ def summarize_day(snapshot: dict[str, Any]) -> dict[str, Any]:
         "movement_minutes": light_minutes + active_minutes,
         "sedentary_minutes": sedentary_minutes,
         "resting_hr": resting_hr,
+        "hrv_daily_rmssd": round_or_none(hrv_daily_rmssd, 1) if hrv_daily_rmssd is not None else None,
+        "hrv_deep_rmssd": round_or_none(hrv_deep_rmssd, 1) if hrv_deep_rmssd is not None else None,
         "zone_minutes": zone_minutes,
         "fat_burn_zone_minutes": fat_burn_zone_minutes,
         "cardio_zone_minutes": cardio_zone_minutes,
@@ -472,6 +484,46 @@ def summarize_day(snapshot: dict[str, Any]) -> dict[str, Any]:
         "sleep_efficiency": sleep_efficiency,
         "weight": profile_user.get("weight"),
         "age": profile_user.get("age"),
+    }
+
+
+def build_recovery_baseline(client: FitbitClient, end_date: str, days: int = 7) -> dict[str, Any]:
+    end = datetime.strptime(end_date, "%Y-%m-%d").date()
+    snapshots = []
+    for offset in range(days - 1, -1, -1):
+        current = end - timedelta(days=offset)
+        try:
+            snapshots.append(summarize_day(get_day_snapshot(client, current.isoformat())))
+        except Exception:  # noqa: BLE001
+            continue
+
+    resting_hrs = [item["resting_hr"] for item in snapshots if item.get("resting_hr") is not None]
+    hrv_values = [item["hrv_daily_rmssd"] for item in snapshots if item.get("hrv_daily_rmssd") is not None]
+
+    avg_rhr = round(sum(resting_hrs) / len(resting_hrs), 1) if resting_hrs else None
+    avg_hrv = round(sum(hrv_values) / len(hrv_values), 1) if hrv_values else None
+    latest = snapshots[-1] if snapshots else None
+
+    resting_hr_elevated = bool(
+        latest
+        and avg_rhr is not None
+        and latest.get("resting_hr") is not None
+        and latest["resting_hr"] >= avg_rhr + 3
+    )
+    hrv_suppressed = bool(
+        latest
+        and avg_hrv is not None
+        and latest.get("hrv_daily_rmssd") is not None
+        and latest["hrv_daily_rmssd"] <= avg_hrv * 0.85
+    )
+
+    return {
+        "days": days,
+        "avg_resting_hr": avg_rhr,
+        "avg_hrv_daily_rmssd": avg_hrv,
+        "resting_hr_elevated": resting_hr_elevated,
+        "hrv_suppressed": hrv_suppressed,
+        "pair_flag": resting_hr_elevated and hrv_suppressed,
     }
 
 
@@ -728,6 +780,14 @@ def coach_day(day: dict[str, Any]) -> dict[str, Any]:
     if sedentary_minutes > 600:
         notes.append("Sedentary time crept high, so sprinkle short movement snacks through the day.")
 
+    if day.get("rhr_hrv_pair_flag"):
+        recovery_score -= 1
+        notes.append("Resting HR is up while HRV is suppressed versus your recent baseline, which is a real recovery caution flag.")
+    elif day.get("resting_hr_elevated"):
+        notes.append("Resting HR is above your recent baseline, so I want a little more respect for recovery.")
+    elif day.get("hrv_suppressed"):
+        notes.append("HRV is softer than your recent baseline, so I do not want to pretend recovery is perfect.")
+
     if completed_exercise:
         if recovery_score >= 2:
             readiness = "trained"
@@ -913,29 +973,37 @@ def run_due_scheduler_cycle(
 
 
 def handle_water_sms_reply(client: FitbitClient, body: str, target_date: str) -> str:
-    current_total = client.get_water_total(target_date)
+    log_date = parse_relative_date(body, target_date)
+    current_total = client.get_water_total(log_date)
     interpreted = interpret_water_entry(body, current_total)
     if interpreted is None:
         return "I could not parse the water amount. Reply with something like '24 oz'."
     if interpreted["logged_amount_oz"] != 0:
-        client.add_water_intake(target_date, interpreted["logged_amount_oz"], source="sms", note=body.strip())
-    report = build_water_report(client, target_date)
+        client.add_water_intake(log_date, interpreted["logged_amount_oz"], source="sms", note=body.strip())
+    report = build_water_report(client, log_date)
+    date_phrase = (
+        "for yesterday"
+        if log_date == parse_relative_date("yesterday", target_date)
+        else "for tomorrow"
+        if log_date == parse_relative_date("tomorrow", target_date)
+        else "for today"
+    )
     if interpreted["entry_type"] == "total" and interpreted["logged_amount_oz"] == 0:
         return (
             f"Got it. I already had you at {current_total} oz, so I did not add more. "
-            f"Current total stays {report['total_oz']} oz."
+            f"Current total stays {report['total_oz']} oz {date_phrase}."
         )
     if interpreted["entry_type"] == "total" and interpreted["logged_amount_oz"] < 0:
         return (
-            f"Corrected. I reset your total to {report['total_oz']} oz for today."
+            f"Corrected. I reset your total to {report['total_oz']} oz {date_phrase}."
         )
     if report["status"] == "met":
         return (
-            f"Logged {interpreted['logged_amount_oz']} oz. You are now at {report['total_oz']} oz, which clears today's hydration target. Nice work."
+            f"Logged {interpreted['logged_amount_oz']} oz. You are now at {report['total_oz']} oz {date_phrase}, which clears the hydration target. Nice work."
         )
     return (
-        f"Logged {interpreted['logged_amount_oz']} oz. You are now at {report['total_oz']} oz, with a goal range of "
-        f"{report['minimum_target_oz']}-{report['ideal_target_oz']} oz today."
+        f"Logged {interpreted['logged_amount_oz']} oz. You are now at {report['total_oz']} oz {date_phrase}, with a goal range of "
+        f"{report['minimum_target_oz']}-{report['ideal_target_oz']} oz."
     )
 
 
@@ -1086,6 +1154,12 @@ def build_exercise_goal(day: dict[str, Any], goals: dict[str, Any], primary_goal
 
 def build_coach_report(client: FitbitClient, target_date: str) -> dict[str, Any]:
     day = summarize_day(get_day_snapshot(client, target_date))
+    recovery_baseline = build_recovery_baseline(client, target_date, 7)
+    day["resting_hr_baseline"] = recovery_baseline["avg_resting_hr"]
+    day["hrv_baseline"] = recovery_baseline["avg_hrv_daily_rmssd"]
+    day["resting_hr_elevated"] = recovery_baseline["resting_hr_elevated"]
+    day["hrv_suppressed"] = recovery_baseline["hrv_suppressed"]
+    day["rhr_hrv_pair_flag"] = recovery_baseline["pair_flag"]
     coaching = coach_day(day)
     goals = client.get_user_goals()
     day["readiness"] = coaching["readiness"]
@@ -1121,14 +1195,19 @@ def build_coach_report(client: FitbitClient, target_date: str) -> dict[str, Any]
             "movement_minutes": day["movement_minutes"],
             "sedentary_minutes": day["sedentary_minutes"],
             "resting_hr": day["resting_hr"],
+            "resting_hr_baseline": day["resting_hr_baseline"],
+            "hrv_daily_rmssd": day["hrv_daily_rmssd"],
+            "hrv_baseline": day["hrv_baseline"],
             "zone_minutes": day["zone_minutes"],
             "fat_burn_zone_minutes": day["fat_burn_zone_minutes"],
             "cardio_zone_minutes": day["cardio_zone_minutes"],
             "peak_zone_minutes": day["peak_zone_minutes"],
+            "sleep_minutes": day["sleep_minutes"],
             "sleep": format_minutes(day["sleep_minutes"]),
             "time_in_bed": format_minutes(day["time_in_bed_minutes"]),
             "sleep_efficiency": day["sleep_efficiency"],
         },
+        "recovery_baseline": recovery_baseline,
         "notes": coaching["notes"],
     }
 
@@ -1143,10 +1222,12 @@ def build_trends_report(client: FitbitClient, end_date: str, days: int) -> dict[
     steps = [item["steps"] for item in snapshots]
     sleep_minutes = [item["sleep_minutes"] for item in snapshots if item["sleep_minutes"] > 0]
     resting_hrs = [item["resting_hr"] for item in snapshots if item["resting_hr"] is not None]
+    hrv_values = [item["hrv_daily_rmssd"] for item in snapshots if item.get("hrv_daily_rmssd") is not None]
     hit_step_goal_days = sum(1 for item in snapshots if (item["step_goal_pct"] or 0) >= 100)
     avg_steps = round(sum(steps) / len(steps), 1) if steps else 0
     avg_sleep = round(sum(sleep_minutes) / len(sleep_minutes)) if sleep_minutes else 0
     avg_rhr = round(sum(resting_hrs) / len(resting_hrs), 1) if resting_hrs else None
+    avg_hrv = round(sum(hrv_values) / len(hrv_values), 1) if hrv_values else None
     consistency = "strong" if hit_step_goal_days >= 5 else "fair" if hit_step_goal_days >= 3 else "needs work"
 
     coach_notes: list[str] = []
@@ -1156,6 +1237,17 @@ def build_trends_report(client: FitbitClient, end_date: str, days: int) -> dict[
         coach_notes.append("Movement volume is low for a fat-loss phase, so daily walking is the highest-return lever.")
     if avg_rhr is not None and snapshots[-1]["resting_hr"] is not None and snapshots[-1]["resting_hr"] >= avg_rhr + 3:
         coach_notes.append("Today’s resting heart rate is meaningfully above your 7-day average, so recovery gets veto power.")
+    if avg_hrv is not None and snapshots[-1].get("hrv_daily_rmssd") is not None and snapshots[-1]["hrv_daily_rmssd"] <= avg_hrv * 0.85:
+        coach_notes.append("Today’s HRV is meaningfully below your 7-day average, so I want more humility about recovery.")
+    if (
+        avg_rhr is not None
+        and snapshots[-1]["resting_hr"] is not None
+        and snapshots[-1]["resting_hr"] >= avg_rhr + 3
+        and avg_hrv is not None
+        and snapshots[-1].get("hrv_daily_rmssd") is not None
+        and snapshots[-1]["hrv_daily_rmssd"] <= avg_hrv * 0.85
+    ):
+        coach_notes.append("High resting HR plus low HRV together is a stronger recovery caution signal than either one alone.")
     if not coach_notes:
         coach_notes.append("The weekly trend is stable enough to keep progressing with consistency over drama.")
 
@@ -1169,6 +1261,7 @@ def build_trends_report(client: FitbitClient, end_date: str, days: int) -> dict[
             "steps": avg_steps,
             "sleep": format_minutes(avg_sleep),
             "resting_hr": avg_rhr,
+            "hrv_daily_rmssd": avg_hrv,
         },
         "consistency": {
             "step_goal_hit_days": hit_step_goal_days,
@@ -1181,6 +1274,7 @@ def build_trends_report(client: FitbitClient, end_date: str, days: int) -> dict[
                 "step_goal_pct": item["step_goal_pct"],
                 "sleep": format_minutes(item["sleep_minutes"]),
                 "resting_hr": item["resting_hr"],
+                "hrv_daily_rmssd": item.get("hrv_daily_rmssd"),
                 "active_minutes": item["active_minutes"],
             }
             for item in snapshots
@@ -1428,22 +1522,28 @@ def build_readiness_reasons(report: dict[str, Any]) -> list[str]:
     stats = report["stats"]
     reasons: list[str] = []
 
+    if report.get("recovery_baseline", {}).get("pair_flag"):
+        reasons.append("resting HR is up and HRV is down versus your recent baseline")
+
+    sleep_minutes = stats.get("sleep_minutes") or 0
     sleep_text = stats.get("sleep")
     sleep_efficiency = stats.get("sleep_efficiency")
     step_goal_pct = stats.get("step_goal_pct") or 0
     zone_minutes = stats.get("zone_minutes") or 0
     movement_minutes = stats.get("movement_minutes") or 0
 
-    if sleep_text and sleep_text != "n/a":
-        reasons.append(f"sleep was {sleep_text}")
+    if sleep_minutes and sleep_minutes < 420 and sleep_text and sleep_text != "n/a":
+        reasons.append(f"sleep was only {sleep_text}")
     if sleep_efficiency is not None and sleep_efficiency < 85:
         reasons.append(f"sleep efficiency was {sleep_efficiency}")
     if zone_minutes < 20:
         reasons.append(f"true exercise dose is still low at {zone_minutes} zone minutes")
     if step_goal_pct < 80:
         reasons.append(f"daily movement is only {step_goal_pct}% of your step goal")
-    elif movement_minutes >= 120:
+    elif movement_minutes >= 120 and not reasons:
         reasons.append(f"you do have plenty of base movement at {movement_minutes} movement minutes")
+    if not reasons and sleep_text and sleep_text != "n/a":
+        reasons.append(f"recovery is decent but not so convincing that I want to force intensity just because I can")
 
     return reasons
 
@@ -1506,12 +1606,17 @@ def format_coach_reply(report: dict[str, Any]) -> str:
     notes = " ".join(report["notes"])
     reasons = build_readiness_reasons(report)
     why_line = f"My main reason is that {reasons[0]}." if reasons else "My main reason is that recovery does not quite justify a green light."
+    hrv_line = (
+        f" HRV is {stats['hrv_daily_rmssd']} ms against a 7-day baseline of {stats['hrv_baseline']} ms."
+        if stats.get("hrv_daily_rmssd") is not None and stats.get("hrv_baseline") is not None
+        else ""
+    )
     return (
         f"{report['date']}: readiness is {report['readiness']}. {why_line} {report['prescription']} "
         f"Steps are {stats['steps']} of {stats['step_goal']} ({stats['step_goal_pct']}%), "
         f"zone minutes are {stats['zone_minutes']} "
         f"({stats['fat_burn_zone_minutes']} fat burn, {stats['cardio_zone_minutes']} cardio, {stats['peak_zone_minutes']} peak), "
-        f"sleep is {stats['sleep']} with efficiency {stats['sleep_efficiency']}, and resting HR is {stats['resting_hr']}. "
+        f"sleep is {stats['sleep']} with efficiency {stats['sleep_efficiency']}, and resting HR is {stats['resting_hr']}.{hrv_line} "
         f"{notes}"
     )
 
@@ -1770,6 +1875,10 @@ def extract_requested_future_activity(prompt: str) -> str | None:
     return None
 
 
+def extract_requested_activity(prompt: str) -> str | None:
+    return extract_requested_future_activity(prompt)
+
+
 def detect_reentry_gap_days(client: FitbitClient, target_date: str) -> int | None:
     recent = client.read_recent_interactions(limit=5)
     if not recent:
@@ -1912,6 +2021,57 @@ def format_tomorrow_activity_reply(client: FitbitClient, prompt: str, target_dat
     )
 
 
+def format_today_activity_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
+    activity = extract_requested_activity(prompt) or "that session"
+    coach = build_coach_report(client, target_date)
+    stats = coach["stats"]
+    reasons = build_readiness_reasons(coach)
+    caution_reasons = [
+        reason
+        for reason in reasons
+        if "true exercise dose is still low" not in reason and "base movement" not in reason
+    ]
+    main_reason = caution_reasons[0] if caution_reasons else "I do not have a strong recovery argument against training today"
+    lowered = activity.lower()
+    higher_intensity = any(keyword in lowered for keyword in ["orange theory", "trx", "strength 50"])
+
+    if coach["readiness"] in {"trained", "trained-but-watch-recovery"}:
+        return (
+            f"No, I would skip {activity} today. You already have enough exercise on the board, and I’d rather protect recovery than pile on another session."
+        )
+
+    if higher_intensity and coach["readiness"] == "yellow":
+        if not caution_reasons:
+            return (
+                f"Yes, {activity} is reasonable today. "
+                f"You have decent sleep, plenty of movement, and no strong recovery veto showing up. "
+                "I would still treat it like a normal training day, not an excuse to chase your own funeral."
+            )
+        return (
+            f"Maybe, but I would treat {activity} as optional rather than the smart default. "
+            f"My hesitation is mostly that {main_reason}. With {stats['steps']} steps already and only {stats['zone_minutes']} zone minutes, "
+            "I’m more comfortable with a moderate or technique-biased version than with an all-out effort."
+        )
+
+    if higher_intensity and coach["readiness"] == "amber":
+        return (
+            f"No, I would skip {activity} today. My main reason is {main_reason}, and amber is not the day for proving you have character."
+        )
+
+    return (
+        f"Yes, {activity} is reasonable today if your body feels cooperative. "
+        f"My main caution flag is that {main_reason}. I’d keep the effort honest but not theatrical."
+    )
+
+
+def format_strength_technique_reply() -> str:
+    return (
+        "When I say strength technique, I mean a lighter, cleaner strength session instead of a go-to-war session. "
+        "Think: fewer sets, more rest, solid form, stopping with a rep or two in reserve, and treating the workout like practice rather than a test. "
+        "In real life that means no hero weights, no chasing failure, and leaving the gym feeling better organized, not flattened."
+    )
+
+
 def build_llm_context(client: FitbitClient, prompt: str, target_date: str) -> dict[str, Any]:
     topic = detect_topic(prompt)
     context: dict[str, Any] = {"date": target_date, "topic_hint": topic}
@@ -1983,7 +2143,11 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
             return apply_recent_sleep_context(client, format_tomorrow_activity_reply(client, prompt, target_date), target_date)
         return apply_recent_sleep_context(client, format_tomorrow_plan_reply(client, target_date), target_date)
     if topic == "today_plan":
+        if "ok to" in text or "okay to" in text or "can i" in text or "should i go to" in text or "should i try to make it to" in text:
+            return apply_recent_sleep_context(client, format_today_activity_reply(client, prompt, target_date), target_date)
         return apply_recent_sleep_context(client, format_today_plan_reply(client, target_date), target_date)
+    if topic == "strength_technique":
+        return format_strength_technique_reply()
     if topic == "zepbound":
         return format_zepbound_reply(build_zepbound_report(client, target_date))
     if topic == "fatloss":
@@ -2130,6 +2294,16 @@ def detect_topic(text: str) -> str:
         return "tomorrow_plan"
     if any(phrase in text for phrase in ["what should i do today", "today plan", "plan for today", "what now"]):
         return "today_plan"
+    if "today" in text and any(word in text for word in ["orange theory", "trx", "class", "workout"]):
+        return "today_plan"
+    if any(phrase in text for phrase in ["should i go to", "should i try to make it to", "can i go to", "can i do", "am i ok to", "am i okay to"]) and (
+        "today" in text or any(word in text for word in ["orange theory", "trx", "class", "workout"])
+    ):
+        return "today_plan"
+    if "should i try to make it" in text and any(word in text for word in ["orange theory", "trx", "class", "workout"]):
+        return "today_plan"
+    if "strength technique" in text:
+        return "strength_technique"
     if "water" in text or "hydration" in text or parse_water_oz(text) is not None:
         return "water"
     if any(word in text for word in ["zepbound", "shot", "dose", "dosing", "glp", "medication"]):
