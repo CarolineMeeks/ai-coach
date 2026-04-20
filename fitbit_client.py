@@ -1172,6 +1172,20 @@ def build_training_recommendation(client: FitbitClient, target_date: str) -> dic
             "prompt": "I recommend PT or recovery today, not a hard class. What sounds more realistic: PT, a walk, or full recovery?",
         }
 
+    if coach["readiness"] == "trained":
+        return {
+            "primary": "Enough-for-today",
+            "why": "you already got a meaningful training dose in today",
+            "prompt": "You already trained enough today. I would call that a win and shift to recovery instead of stacking more work.",
+        }
+
+    if coach["readiness"] == "trained-but-watch-recovery":
+        return {
+            "primary": "Recovery or PT only",
+            "why": "you already trained today and recovery is not happy enough to justify a second hit",
+            "prompt": "You already have a real workout on the board today, and recovery is not thrilled. I would choose recovery, or PT if you want something useful without stacking intensity.",
+        }
+
     if coach["readiness"] == "amber":
         return {
             "primary": "Recovery",
@@ -2322,6 +2336,38 @@ def format_today_activity_reply(client: FitbitClient, prompt: str, target_date: 
     )
 
 
+def detect_plan_fragment(text: str) -> str | None:
+    lowered = text.strip().lower()
+    if not lowered or len(lowered.split()) > 6:
+        return None
+    if any(phrase in lowered for phrase in ["trx", "orange theory", "class", "vr strength", "litesport", "strength"]):
+        return "training"
+    if lowered in {"pt", "pt exercises", "physical therapy", "physio"} or "pt" in lowered:
+        return "pt"
+    if lowered in {"walk", "walking", "a walk"}:
+        return "walk"
+    if lowered in {"recovery", "rest", "stretching", "yoga", "mobility"}:
+        return "recovery"
+    return None
+
+
+def format_plan_fragment_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
+    plan_kind = detect_plan_fragment(prompt) or "training"
+    if plan_kind == "training":
+        return format_today_activity_reply(client, prompt, target_date)
+    recommendation = build_training_recommendation(client, target_date)
+    if plan_kind == "pt":
+        return (
+            f"PT is a smart plan. It keeps the day useful without pretending every good decision needs a leaderboard. "
+            f"My current recommendation is {recommendation['primary'].lower()} because {recommendation['why']}."
+        )
+    if plan_kind == "walk":
+        return (
+            "A walk is a good low-drama plan. Keep it comfortable, not performative, and count it as the movement win if recovery is even slightly cranky."
+        )
+    return format_recovery_plan_reply(client, target_date)
+
+
 def format_strength_technique_reply() -> str:
     return (
         "When I say strength technique, I mean a lighter, cleaner strength session instead of a go-to-war session. "
@@ -2343,6 +2389,25 @@ def format_recovery_plan_reply(client: FitbitClient, target_date: str) -> str:
         f"Recovery today would look like this: no hard class, no proving-a-point workout, protein on purpose, hydration handled, and an early-enough night to help tomorrow. "
         f"{walk_line} If you still want something useful, I would choose PT over a real training session. "
         f"My reason is that {recommendation['why']}."
+    )
+
+
+def format_greeting_reply(client: FitbitClient, target_date: str) -> str:
+    coach = build_coach_report(client, target_date)
+    water = build_water_report(client, target_date)
+    zepbound = build_zepbound_report(client, target_date)
+    prompt = build_training_recommendation(client, target_date)["prompt"]
+    stats = coach["stats"]
+    water_line = (
+        f"Water is already at {water['total_oz']} oz."
+        if water["status"] in {"good", "met"}
+        else f"Water is still open at {water['total_oz']} oz."
+    )
+    shot_line = zepbound["goal_status"]["shot_logged"]["summary"]
+    return (
+        f"Good morning. I checked today’s data, and right now I read the day as {coach['readiness']}. "
+        f"You have {stats['steps']} steps, {stats['zone_minutes']} zone minutes, and sleep at {stats['sleep']}. "
+        f"{water_line} {shot_line}. {prompt}"
     )
 
 
@@ -2481,6 +2546,8 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
     text = prompt.strip().lower()
     if detect_topic(text) == "weekly_summary":
         return format_weekly_summary_reply(client, target_date)
+    if detect_plan_fragment(text):
+        return apply_recent_sleep_context(client, format_plan_fragment_reply(client, prompt, target_date), target_date)
     routed_activity = None
     if client.config.openai_api_key:
         try:
@@ -2493,6 +2560,8 @@ def answer_chat(client: FitbitClient, prompt: str, target_date: str) -> str:
         topic = detect_topic(text)
     if topic == "sleep_context":
         return format_sleep_context_reply(client, prompt, target_date)
+    if topic == "greeting":
+        return format_greeting_reply(client, target_date)
     if topic == "reentry":
         return format_reentry_reply(client, prompt, target_date)
     if topic == "tomorrow_plan":
@@ -2559,6 +2628,8 @@ def detect_topic(text: str) -> str:
     text = text.strip().lower()
     if not text:
         return "empty"
+    if any(phrase in text for phrase in ["good morning", "morning", "hello", "hi", "hey"]):
+        return "greeting"
     sleep_flags = detect_manual_sleep_context(text)
     if sleep_flags["forgot_fitbit"] or ("sleep" in text and sleep_flags["slept_well"]):
         return "sleep_context"

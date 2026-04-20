@@ -6,6 +6,7 @@ const state = {
   zepbound: null,
   water: null,
   promptedDate: null,
+  manualDate: false,
 };
 
 const dateInput = document.querySelector("#date-input");
@@ -270,6 +271,14 @@ async function loadHistory() {
 }
 
 async function askCoach(message) {
+  if (!state.manualDate && state.date && state.date !== currentLocalDateIso()) {
+    state.date = "";
+    try {
+      await loadStatus();
+    } catch (error) {
+      addMessage("Coach", error.message || "I tried to refresh for the new day and hit a snag.");
+    }
+  }
   addMessage("You", message);
   chatSubmit.disabled = true;
   chatSubmit.textContent = "Thinking...";
@@ -279,7 +288,7 @@ async function askCoach(message) {
     const response = await fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message, date: state.date }),
+      body: JSON.stringify({ message, date: state.manualDate ? state.date : undefined }),
     });
     const payload = await response.json();
     if (!response.ok) {
@@ -305,6 +314,7 @@ async function askCoach(message) {
 
 dateInput.addEventListener("change", async (event) => {
   state.date = event.target.value;
+  state.manualDate = true;
   try {
     await loadStatus();
   } catch (error) {
