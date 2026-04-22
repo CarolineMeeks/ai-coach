@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Weighted Todo Picker</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg-1: #f8efe2;
+      --bg-2: #f3dcc3;
+      --panel: rgba(255, 250, 244, 0.88);
+      --panel-strong: rgba(255, 247, 239, 0.96);
+      --text: #2b2118;
+      --muted: #6d5a4d;
+      --accent: #bf5b04;
+      --accent-deep: #8a3d00;
+      --accent-soft: #ffd8ab;
+      --teal: #156f67;
+      --border: rgba(138, 61, 0, 0.18);
+      --shadow: 0 24px 70px rgba(76, 41, 13, 0.14);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 15% 20%, rgba(21, 111, 103, 0.18), transparent 28%),
+        radial-gradient(circle at 85% 15%, rgba(191, 91, 4, 0.24), transparent 24%),
+        radial-gradient(circle at 50% 100%, rgba(255, 216, 171, 0.45), transparent 35%),
+        linear-gradient(180deg, var(--bg-1), var(--bg-2));
+      overflow-x: hidden;
+    }
+
+    .page {
+      width: min(1120px, 100%);
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.15fr 0.95fr;
+      gap: 20px;
+      align-items: stretch;
+    }
+
+    .card {
+      position: relative;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 28px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(10px);
+    }
+
+    .intro {
+      padding: 28px;
+      overflow: hidden;
+      isolation: isolate;
+    }
+
+    .intro::before,
+    .intro::after {
+      content: "";
+      position: absolute;
+      border-radius: 999px;
+      opacity: 0.7;
+      z-index: -1;
+    }
+
+    .intro::before {
+      width: 220px;
+      height: 220px;
+      right: -70px;
+      top: -40px;
+      background: radial-gradient(circle, rgba(255, 216, 171, 0.95), rgba(255, 216, 171, 0));
+    }
+
+    .intro::after {
+      width: 180px;
+      height: 180px;
+      left: -70px;
+      bottom: -60px;
+      background: radial-gradient(circle, rgba(21, 111, 103, 0.22), rgba(21, 111, 103, 0));
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-size: 0.75rem;
+      color: var(--accent-deep);
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      font-size: clamp(2.2rem, 5vw, 4.3rem);
+      line-height: 0.92;
+      max-width: 10ch;
+    }
+
+    .lede,
+    .stats,
+    .helper,
+    .result-copy,
+    .list-note {
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 22px;
+    }
+
+    .stat-pill {
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid rgba(21, 111, 103, 0.16);
+      background: rgba(255, 255, 255, 0.7);
+      font-size: 0.95rem;
+    }
+
+    .picker {
+      padding: 24px;
+      display: grid;
+      gap: 18px;
+      align-content: start;
+    }
+
+    .machine {
+      position: relative;
+      min-height: 320px;
+      display: grid;
+      place-items: center;
+      border-radius: 26px;
+      border: 1px solid rgba(138, 61, 0, 0.14);
+      background:
+        radial-gradient(circle at top, rgba(255, 255, 255, 0.95), rgba(255, 247, 239, 0.7)),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.72), rgba(255, 234, 208, 0.82));
+      overflow: hidden;
+    }
+
+    .machine::before {
+      content: "";
+      position: absolute;
+      inset: 16px;
+      border-radius: 22px;
+      border: 1px dashed rgba(138, 61, 0, 0.16);
+      pointer-events: none;
+    }
+
+    .glow {
+      position: absolute;
+      inset: auto 50% 24px auto;
+      width: 280px;
+      height: 72px;
+      transform: translateX(50%);
+      background: radial-gradient(circle, rgba(255, 216, 171, 0.92), rgba(255, 216, 171, 0));
+      filter: blur(10px);
+      pointer-events: none;
+    }
+
+    .number-stage {
+      position: relative;
+      display: grid;
+      place-items: center;
+      width: min(68vw, 280px);
+      aspect-ratio: 1;
+      border-radius: 32px;
+      border: 2px solid rgba(191, 91, 4, 0.2);
+      background: linear-gradient(180deg, rgba(255, 252, 248, 0.95), rgba(255, 232, 205, 0.98));
+      box-shadow: inset 0 10px 20px rgba(255, 255, 255, 0.65), 0 16px 36px rgba(138, 61, 0, 0.15);
+    }
+
+    .number-shell {
+      position: relative;
+      display: grid;
+      place-items: center;
+      width: 78%;
+      aspect-ratio: 1;
+      border-radius: 28px;
+      background: linear-gradient(180deg, #fffaf3, #ffe0b8);
+      border: 1px solid rgba(138, 61, 0, 0.12);
+      overflow: hidden;
+    }
+
+    .number {
+      margin: 0;
+      font-size: clamp(4rem, 13vw, 7rem);
+      line-height: 1;
+      color: var(--accent-deep);
+      transform-origin: center;
+    }
+
+    .number.is-rolling {
+      animation: wobble 170ms linear infinite;
+    }
+
+    .burst {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      overflow: hidden;
+    }
+
+    .spark {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 14px;
+      height: 14px;
+      margin-left: -7px;
+      margin-top: -7px;
+      border-radius: 4px;
+      opacity: 0;
+      transform: translate(0, 0) rotate(0deg) scale(0.4);
+      animation: pop 900ms ease-out forwards;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: center;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 14px 22px;
+      font: inherit;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: transform 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+    }
+
+    button:active {
+      transform: translateY(1px) scale(0.99);
+    }
+
+    button:disabled {
+      opacity: 0.65;
+      cursor: wait;
+      transform: none;
+    }
+
+    .primary {
+      background: linear-gradient(180deg, var(--accent), var(--accent-deep));
+      color: white;
+      box-shadow: 0 10px 22px rgba(138, 61, 0, 0.24);
+    }
+
+    .secondary {
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--accent-deep);
+      border: 1px solid rgba(138, 61, 0, 0.15);
+    }
+
+    .result {
+      padding: 18px;
+      border-radius: 22px;
+      background: var(--panel-strong);
+      border: 1px solid rgba(21, 111, 103, 0.16);
+    }
+
+    .result h2,
+    .list-card h2 {
+      margin: 0 0 8px;
+      font-size: 1.25rem;
+    }
+
+    .selection {
+      margin: 8px 0 6px;
+      font-size: clamp(1.3rem, 3vw, 1.9rem);
+      color: var(--teal);
+    }
+
+    .index-chip {
+      display: inline-block;
+      margin-top: 8px;
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: rgba(21, 111, 103, 0.1);
+      color: var(--teal);
+      font-size: 0.95rem;
+    }
+
+    .list-wrap {
+      margin-top: 20px;
+    }
+
+    .list-card {
+      padding: 24px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 0.95rem;
+      color: var(--accent-deep);
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      resize: vertical;
+      border-radius: 22px;
+      border: 1px solid rgba(138, 61, 0, 0.15);
+      padding: 16px 18px;
+      font: inherit;
+      font-size: 1rem;
+      line-height: 1.6;
+      color: var(--text);
+      background: rgba(255, 255, 255, 0.78);
+    }
+
+    textarea:focus,
+    button:focus {
+      outline: 3px solid rgba(21, 111, 103, 0.2);
+      outline-offset: 2px;
+    }
+
+    .todo-preview {
+      display: grid;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
+    .todo-item {
+      display: flex;
+      gap: 14px;
+      align-items: baseline;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid rgba(138, 61, 0, 0.09);
+      transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+    }
+
+    .todo-item.active {
+      transform: translateX(8px) scale(1.01);
+      border-color: rgba(21, 111, 103, 0.3);
+      background: rgba(219, 248, 244, 0.86);
+    }
+
+    .todo-rank {
+      min-width: 2.2rem;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .todo-text {
+      line-height: 1.5;
+    }
+
+    .helper {
+      margin: 0;
+      font-size: 0.95rem;
+    }
+
+    @keyframes wobble {
+      0% { transform: translateY(-2px) rotate(-5deg) scale(0.97); }
+      50% { transform: translateY(3px) rotate(4deg) scale(1.03); }
+      100% { transform: translateY(-1px) rotate(-3deg) scale(0.98); }
+    }
+
+    @keyframes pop {
+      0% {
+        opacity: 1;
+        transform: translate(0, 0) rotate(0deg) scale(0.4);
+      }
+      100% {
+        opacity: 0;
+        transform: translate(var(--dx), var(--dy)) rotate(var(--rot)) scale(1.2);
+      }
+    }
+
+    @media (max-width: 860px) {
+      .hero {
+        grid-template-columns: 1fr;
+      }
+
+      .picker {
+        order: -1;
+      }
+
+      .number-stage {
+        width: min(72vw, 240px);
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <article class="card intro">
+        <p class="eyebrow">Weighted Randomness</p>
+        <h1>Let chance help, but not too much.</h1>
+        <p class="lede">This picker chooses a rank from 1 to 20, with a strong bias toward the top of your list. It is tuned so roughly 80% of draws land under 10.</p>
+        <div class="stats">
+          <div class="stat-pill">Range: 1-20</div>
+          <div class="stat-pill">Bias: lower numbers favored</div>
+          <div class="stat-pill">Target: about 80% under 10</div>
+        </div>
+      </article>
+
+      <section class="card picker">
+        <div class="machine">
+          <div class="glow"></div>
+          <div class="number-stage">
+            <div class="number-shell">
+              <p id="number" class="number">?</p>
+            </div>
+          </div>
+          <div id="burst" class="burst" aria-hidden="true"></div>
+        </div>
+
+        <div class="controls">
+          <button id="pick-button" class="primary" type="button">Spin The Picker</button>
+          <button id="sample-button" class="secondary" type="button">Load Sample List</button>
+        </div>
+
+        <section class="result" aria-live="polite">
+          <h2>Selected Item</h2>
+          <p id="selection" class="selection">Your next task will land here.</p>
+          <p id="selection-copy" class="result-copy">Paste your prioritized todo list below, one item per line, then spin.</p>
+          <div id="index-chip" class="index-chip" hidden></div>
+        </section>
+      </section>
+    </section>
+
+    <section class="list-wrap">
+      <article class="card list-card">
+        <h2>Prioritized Todo List</h2>
+        <label for="todo-input">Put your highest-priority item first.</label>
+        <textarea id="todo-input" spellcheck="false" placeholder="1. Fix the onboarding copy&#10;2. Reply to Sam&#10;3. Refactor the report export&#10;4. Book dentist appointment"></textarea>
+        <p class="helper">Only the first 20 non-empty lines are used. If your list is shorter than 20, the picker uses the number it drew and wraps it to the available items.</p>
+        <div id="todo-preview" class="todo-preview"></div>
+      </article>
+    </section>
+  </main>
+
+  <script>
+    const MAX_RANK = 20;
+    const BIAS_POWER = 3.58;
+    const ROLL_DURATION_MS = 1800;
+    const sampleTodos = [
+      "Finish the thing that has been quietly judging me from the top of the list",
+      "Reply to the important email",
+      "Book the appointment",
+      "Close one lingering admin task",
+      "Draft the next project step",
+      "Tidy the desktop",
+      "Read the document I have been avoiding",
+      "Do the five-minute fix that will probably take four",
+      "Prep tomorrow's top task",
+      "Refill water and reset"
+    ];
+
+    const todoInput = document.getElementById("todo-input");
+    const todoPreview = document.getElementById("todo-preview");
+    const pickButton = document.getElementById("pick-button");
+    const sampleButton = document.getElementById("sample-button");
+    const numberEl = document.getElementById("number");
+    const selectionEl = document.getElementById("selection");
+    const selectionCopyEl = document.getElementById("selection-copy");
+    const indexChipEl = document.getElementById("index-chip");
+    const burstEl = document.getElementById("burst");
+
+    function parseTodos() {
+      return todoInput.value
+        .split("\n")
+        .map((line) => line.replace(/^(\s*[-*]|\s*\d+[.)])\s*/, "").trim())
+        .filter(Boolean)
+        .slice(0, MAX_RANK);
+    }
+
+    function renderTodos(activeIndex = -1) {
+      const todos = parseTodos();
+      todoPreview.innerHTML = "";
+
+      if (!todos.length) {
+        return;
+      }
+
+      todos.forEach((todo, index) => {
+        const item = document.createElement("div");
+        item.className = "todo-item";
+        if (index === activeIndex) {
+          item.classList.add("active");
+        }
+
+        const rank = document.createElement("div");
+        rank.className = "todo-rank";
+        rank.textContent = String(index + 1).padStart(2, "0");
+
+        const text = document.createElement("div");
+        text.className = "todo-text";
+        text.textContent = todo;
+
+        item.append(rank, text);
+        todoPreview.append(item);
+      });
+    }
+
+    function weightedRank() {
+      return Math.ceil(MAX_RANK * Math.pow(Math.random(), BIAS_POWER));
+    }
+
+    function createBurst() {
+      burstEl.innerHTML = "";
+      const colors = ["#bf5b04", "#156f67", "#ffb84d", "#ff8a3d", "#0e8b80"];
+
+      for (let i = 0; i < 18; i += 1) {
+        const spark = document.createElement("span");
+        spark.className = "spark";
+        spark.style.background = colors[i % colors.length];
+        spark.style.setProperty("--dx", `${(Math.random() - 0.5) * 240}px`);
+        spark.style.setProperty("--dy", `${(Math.random() - 0.5) * 200}px`);
+        spark.style.setProperty("--rot", `${Math.round(Math.random() * 360)}deg`);
+        burstEl.appendChild(spark);
+      }
+    }
+
+    function applySelection(rank) {
+      const todos = parseTodos();
+
+      if (!todos.length) {
+        selectionEl.textContent = `Rank ${rank}`;
+        selectionCopyEl.textContent = "Add some todo items below and spin again to map the drawn rank to an actual task.";
+        indexChipEl.hidden = false;
+        indexChipEl.textContent = `Weighted draw: ${rank} of ${MAX_RANK}`;
+        renderTodos();
+        return;
+      }
+
+      const selectedIndex = (rank - 1) % todos.length;
+      const selectedTodo = todos[selectedIndex];
+      selectionEl.textContent = selectedTodo;
+      selectionCopyEl.textContent = `The picker drew ${rank}. With ${todos.length} items in your list, that maps to item ${selectedIndex + 1}.`;
+      indexChipEl.hidden = false;
+      indexChipEl.textContent = `Drawn rank ${rank} -> list item ${selectedIndex + 1}`;
+      renderTodos(selectedIndex);
+    }
+
+    function animatePick() {
+      if (pickButton.disabled) {
+        return;
+      }
+
+      pickButton.disabled = true;
+      sampleButton.disabled = true;
+      numberEl.classList.add("is-rolling");
+      selectionEl.textContent = "Consulting the tiny chaos engine...";
+      selectionCopyEl.textContent = "Top-ranked items have better odds, but we are still leaving room for surprise.";
+      indexChipEl.hidden = true;
+
+      const finalRank = weightedRank();
+      const start = performance.now();
+
+      function tick(now) {
+        const elapsed = now - start;
+
+        if (elapsed < ROLL_DURATION_MS) {
+          numberEl.textContent = String(1 + Math.floor(Math.random() * MAX_RANK));
+          window.requestAnimationFrame(tick);
+          return;
+        }
+
+        numberEl.classList.remove("is-rolling");
+        numberEl.textContent = String(finalRank);
+        createBurst();
+        applySelection(finalRank);
+        pickButton.disabled = false;
+        sampleButton.disabled = false;
+      }
+
+      window.requestAnimationFrame(tick);
+    }
+
+    todoInput.addEventListener("input", () => {
+      renderTodos();
+    });
+
+    pickButton.addEventListener("click", animatePick);
+
+    sampleButton.addEventListener("click", () => {
+      todoInput.value = sampleTodos.join("\n");
+      renderTodos();
+    });
+
+    renderTodos();
+  </script>
+</body>
+</html>
