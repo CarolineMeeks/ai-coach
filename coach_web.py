@@ -21,6 +21,7 @@ from fitbit_client import (
     answer_chat,
     build_coach_report,
     build_fatloss_report,
+    build_training_recommendation,
     run_due_scheduler_cycle,
     build_trends_report,
     build_water_report,
@@ -185,6 +186,7 @@ def make_handler(client: FitbitClient):
                         {
                             "date": target_date,
                             "coach": build_coach_report(client, target_date),
+                            "training_recommendation": build_training_recommendation(client, target_date),
                         },
                     )
                 except Exception as exc:  # noqa: BLE001

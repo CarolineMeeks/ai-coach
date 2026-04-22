@@ -5,6 +5,7 @@ const state = {
   fatloss: null,
   zepbound: null,
   water: null,
+  trainingRecommendation: null,
   promptedDate: null,
   manualDate: false,
 };
@@ -102,6 +103,9 @@ function currentLocalDateIso() {
 function buildPlanningPrompt(coach) {
   if (!coach || !state.date || state.date !== currentLocalDateIso()) {
     return null;
+  }
+  if (state.trainingRecommendation?.prompt) {
+    return state.trainingRecommendation.prompt;
   }
   const readiness = coach.readiness;
   const hour = new Date().getHours();
@@ -205,6 +209,7 @@ async function loadToday() {
     const path = state.date ? `/api/today?date=${state.date}` : "/api/today";
     const payload = await fetchJson(path);
     state.coach = payload.coach;
+    state.trainingRecommendation = payload.training_recommendation || null;
     state.date = payload.date;
     dateInput.value = state.date;
     setSummary(payload);
@@ -253,6 +258,7 @@ async function loadStatus() {
   state.fatloss = null;
   state.zepbound = null;
   state.water = null;
+  state.trainingRecommendation = null;
   await loadToday();
   await loadSecondary();
   maybePromptForPlan();

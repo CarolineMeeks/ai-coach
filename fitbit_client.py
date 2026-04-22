@@ -800,7 +800,7 @@ def coach_day(day: dict[str, Any]) -> dict[str, Any]:
         prescription = "You are clear for a normal training day: strength work or a solid bike/hike effort is reasonable."
     elif recovery_score >= 2:
         readiness = "yellow"
-        prescription = "This is a build-the-base day: strength technique, brisk walking, easy biking, or dancing without chasing intensity."
+        prescription = "This is a moderate day: useful movement or technique-focused strength is fine, but I do not want max-intensity heroics."
     else:
         readiness = "amber"
         prescription = "Keep today restorative: walking, mobility, easy movement, and protein on purpose. Heroics are cancelled."
@@ -1155,9 +1155,34 @@ def build_exercise_goal(day: dict[str, Any], goals: dict[str, Any], primary_goal
 def build_training_recommendation(client: FitbitClient, target_date: str) -> dict[str, str]:
     coach = build_coach_report(client, target_date)
     stats = coach["stats"]
+    target = datetime.strptime(target_date, "%Y-%m-%d").date()
+    yesterday_date = (target - timedelta(days=1)).isoformat()
+    yesterday: dict[str, Any] | None = None
+    try:
+        yesterday = summarize_day(get_day_snapshot(client, yesterday_date))
+    except Exception:  # noqa: BLE001
+        yesterday = None
     recent_workouts = client.get_recent_workouts(limit=3)
+    yesterday_logged_strength = any(
+        item.get("workout_date") == yesterday_date
+        and item.get("source") != "planned"
+        and (
+            item.get("workout_category") == "strength"
+            or "strength" in (item.get("workout_name") or "").lower()
+        )
+        for item in recent_workouts
+    )
+    yesterday_big_training = bool(
+        yesterday
+        and (
+            yesterday.get("zone_minutes", 0) >= 45
+            or yesterday.get("active_minutes", 0) >= 60
+            or yesterday.get("movement_minutes", 0) >= 150
+        )
+    )
     recent_strength = any(
-        (item.get("workout_category") == "strength") or ("strength" in (item.get("workout_name") or "").lower())
+        item.get("source") != "planned"
+        and ((item.get("workout_category") == "strength") or ("strength" in (item.get("workout_name") or "").lower()))
         for item in recent_workouts
     )
     pair_flag = bool(coach.get("recovery_baseline", {}).get("pair_flag"))
@@ -1170,6 +1195,20 @@ def build_training_recommendation(client: FitbitClient, target_date: str) -> dic
             "primary": "PT or recovery",
             "why": "your resting HR is up and HRV is down versus baseline, which is a real recovery caution flag",
             "prompt": "I recommend PT or recovery today, not a hard class. What sounds more realistic: PT, a walk, or full recovery?",
+        }
+
+    if yesterday_logged_strength and yesterday_big_training:
+        return {
+            "primary": "PT or recovery",
+            "why": "yesterday was a strength day with a big activity load, so today should not stack another hard strength/class hit",
+            "prompt": "Yesterday already had strength plus a big training load. I would make today PT, mobility, walking, or recovery rather than another class.",
+        }
+
+    if yesterday_big_training:
+        return {
+            "primary": "Recovery-biased day",
+            "why": "yesterday already carried a big training load",
+            "prompt": "Yesterday was a big activity day. I would keep today recovery-biased: walking, mobility, PT, stretching, or light yoga.",
         }
 
     if coach["readiness"] == "trained":
@@ -2351,12 +2390,31 @@ def detect_plan_fragment(text: str) -> str | None:
     return None
 
 
+def maybe_record_planned_workout(client: FitbitClient, prompt: str, target_date: str) -> None:
+    plan_kind = detect_plan_fragment(prompt)
+    if plan_kind not in {"training", "pt"}:
+        return
+    activity = extract_requested_activity(prompt) or prompt.strip()
+    activity = re.sub(r"\s+", " ", activity).strip(" .,-")
+    if not activity:
+        return
+    client.add_workout_log(
+        target_date,
+        activity,
+        workout_category=categorize_workout(activity),
+        source="planned",
+        note=f"User said they planned: {prompt.strip()}",
+    )
+
+
 def format_plan_fragment_reply(client: FitbitClient, prompt: str, target_date: str) -> str:
     plan_kind = detect_plan_fragment(prompt) or "training"
     if plan_kind == "training":
+        maybe_record_planned_workout(client, prompt, target_date)
         return format_today_activity_reply(client, prompt, target_date)
     recommendation = build_training_recommendation(client, target_date)
     if plan_kind == "pt":
+        maybe_record_planned_workout(client, prompt, target_date)
         return (
             f"PT is a smart plan. It keeps the day useful without pretending every good decision needs a leaderboard. "
             f"My current recommendation is {recommendation['primary'].lower()} because {recommendation['why']}."
